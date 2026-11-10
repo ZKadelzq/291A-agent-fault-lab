@@ -65,7 +65,7 @@ def main(exp):
     model = rows[0].get("model", "unknown (run predates the model field)")
     modes = sorted({r.get("cash_mode", "legacy") for r in rows})
     harness = sorted({r.get("harness", "v1") for r in rows})
-    parts = [f"# Phase 1 summary: `{os.path.basename(os.path.normpath(exp))}` (model `{model}`, {len(rows)} episodes, "
+    parts = [f"# Experiment summary: `{os.path.basename(os.path.normpath(exp))}` (model `{model}`, {len(rows)} episodes, "
              f"harness {'/'.join(harness)}, cash {'/'.join(modes)})\n"]
     if len(modes) > 1:
         parts.append("**Warning:** this folder mixes cash modes; compare like with like.\n")
@@ -93,7 +93,10 @@ def main(exp):
     n_bad = sum(1 for r in all_none if not r["correct"])
     if n_bad:
         parts.append(f"\n**Warning:** the clean run failed on {n_bad} task(s); fault outcomes there are `clean_failed`.")
-    if not any(r.get("api_s") for r in rows):
+    if model == 'deterministic-test-double':
+        parts.append('\nDeterministic model double: token counts are synthetic and latency is local test time. '
+                     'These results test mechanisms, not real LLM performance.')
+    elif not any(r.get("api_s") for r in rows):
         parts.append("\nLatency note: this run predates backoff instrumentation, so `api_backoff_s` is 0 and observed "
                      "latency includes rate-limit waits. Use tokens / LLM calls as the primary compute-cost measure.")
     elif not any(r["backoff_s"] for r in rows):
@@ -151,9 +154,27 @@ def main(exp):
         parts.append("\n## Table 2d: timeout faults decomposed\n\n" + table(
             ["fault", "method", "n", "timeout fired", "call committed anyway", "retry attempted",
              "read_account after timeout", "duplicate attempted", "duplicate committed", "task harmed"], tr)
-            + "\n\nE-timeout: the `buy` commits, then the agent is told the call timed out with unknown status. "
+            + "\n\nE-timeout returns unknown status to the agent. `config.timeout_outcome` specifies the simulated "
+              "service scenario: committed, not_committed, or unknown (committed but status query unavailable). "
               "`duplicate attempted` vs `duplicate committed` separates the agent's reaction from what the "
               "environment allowed (with legacy cash a retried buy is often rejected for insufficient funds).")
+
+    if any('request_retry_attempted' in r for r in rows):
+        detail = []
+        for method in METHOD_ORDER:
+            rs = [r for r in rows if r['method'] == method and r['fault'] != 'clean']
+            if rs:
+                detail.append([method] + [sum(r.get(key, 0) for r in rs) for key in
+                    ('request_retry_attempted', 'request_retry_committed', 'business_dup_attempted',
+                     'business_dup_committed')])
+        parts.append('\n## Request retries and business duplicates\n\n' + table(
+            ['method', 'request retry attempts', 'request retry commits',
+             'distinct duplicate requests', 'distinct duplicate request commits'], detail)
+            + '\n\nRetries require the same logical step, tool and exact arguments. Business duplicates are '
+              'distinct requests repeating the same task-specific action (e.g. buying the same ticker twice). '
+              'Compensations and rolled-back branches are excluded. A retry can commit without creating a '
+              'duplicate effect when the first attempt did not commit. These identities provide metrics, '
+              'not service-side idempotency.')
 
     # Table 3: recovery baselines, end-to-end
     for title, names in (("3a: accidental faults", ACCIDENTAL + CONTROL), ("3b: adversarial faults", ADVERSARIAL)):
@@ -168,12 +189,15 @@ def main(exp):
                           f(mean(r["unauthorized"] for r in rs)), f(mean(r["total_tokens"] for r in rs), 0),
                           f(mean(r["total_latency"] for r in rs), 1), f(mean(r["total_backoff"] for r in rs), 1),
                           f(mean(r.get("recomputed") for r in rs), 1), f(mean(r.get("unrecoverable") for r in rs)),
-                          f(mean(r.get("detected") for r in rs)), f(mean(r.get("false_alarms") for r in rs))])
+                          f(mean(r.get("detected") for r in rs)), f(mean(r.get("false_alarms") for r in rs)),
+                          ', '.join(sorted({r['recovery_status'] for r in rs if 'recovery_status' in r})),
+                          f(mean(r.get('compensations') for r in rs), 1)])
         if t:
             parts.append(f"\n## Table {title}: recovery baselines (end-to-end)\n\n" + table(
                 ["fault", "method", "n", "outcome", "safe_success", "unauthorized", "total_tokens", "total_latency_s",
-                 "api_backoff_s", "recomputed", "unrecoverable", "detected", "false_alarms"], t))
-    parts.append("\n`total_*` = faulty run + recovery for restart (the raw rows only hold the rerun); for verify it is the "
+                 "api_backoff_s", "recomputed", "unrecoverable", "detected", "false_alarms",
+                 'recovery_status', 'compensations'], t))
+    parts.append("\n`total_*` = faulty run + new recovery work for every registered recovery strategy; for verify it is the "
                  "single run including verification. `detected`/`false_alarms` are only defined for verify, which "
                  "checks every research report and the plan before execution and does NOT check executor actions "
                  "(so E-timeout cannot be detected by design). `unrecoverable` = irreversible actions (e.g. an emailed "

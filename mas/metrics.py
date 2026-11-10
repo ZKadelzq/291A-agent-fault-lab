@@ -21,6 +21,7 @@ import re
 from .env import MARKET
 from .faults import KINDS
 from .trace import tokens
+from .plan import contract, digest
 
 FREE_TEXT = {"content", "body", "subject"}
 # Tools whose repetition changes the world (a repeated set_stop_loss / write_file just rewrites the same value).
@@ -50,6 +51,8 @@ def signature(node):
         d = node.data if isinstance(node.data, dict) else {}
         return (str(d.get("rating")).lower(), str(d.get("sector")).lower(), d.get("price"))
     if node.agent == "planner":  # a report-writing step is free text
+        if node.data and all('op' in s for s in node.data):
+            return tuple(digest(contract(s)) for s in node.data)
         return tuple(sorted(decisions(s["instruction"], ".md" in s["instruction"]) for s in node.data or []))
     return tuple((a["tool"], tuple(sorted((k, decisions(v, k in FREE_TEXT)) for k, v in a["args"].items())))
                  for a in node.actions)
@@ -64,23 +67,63 @@ def action_key(a):
     return a["tool"], tuple(sorted((k, str(v).strip().lower()) for k, v in args.items()))
 
 
-def duplicate_actions(trace):
-    """(attempted, committed) repeated side-effecting calls among the agents' actions in this trace.
-    Uses the trace's own actions, so for restart the faulty run before the rollback is not counted."""
-    seen, attempted, committed = set(), 0, 0
+def duplicate_metrics(trace, audit=()):
+    """Separate exact-payload retries from distinct requests repeating a business action.
+
+    Request identity is scoped to a logical step AND tool/full arguments; it is
+    an inferred retry grouping, not a server idempotency guarantee. Business
+    identity is task-specific: at most one buy per ticker is intended here.
+    Ground truth may be supplied by the evaluator, never by recovery strategies.
+    """
+    truth = {a['id']: a for a in audit}
+    requests, businesses, committed_requests, committed_businesses = set(), set(), set(), set()
+    unknown_businesses = set()
+    business_owners = {}
+    m = dict.fromkeys(('request_retry_attempted', 'request_retry_committed', 'business_dup_attempted',
+                       'business_dup_committed', 'dup_attempted', 'dup_committed',
+                       'rejected_duplicate_attempts', 'duplicate_commit_unknown'), 0)
     for n in trace.nodes.values():
         for a in n.actions:
             if a["tool"] not in SIDE_EFFECT_TOOLS:
                 continue
-            k = action_key(a)
-            if k in seen:
-                attempted += 1
-                committed += bool(a["writes"])
-            seen.add(k)
-    return attempted, committed
+            if a.get('recovery_authorized') or a.get('active') is False:
+                continue
+            request = (a.get('branch_id'), a.get('operation_id') or n.id, a['tool'], digest(a['args']))
+            business = (a.get('branch_id'), action_key(a))
+            receipt = truth.get(a['id'], a)
+            committed = receipt.get('committed', bool(receipt.get('writes')))
+            retry = request in requests
+            duplicate = business in businesses
+            m['request_retry_attempted'] += retry
+            m['request_retry_committed'] += retry and committed is True
+            m['business_dup_attempted'] += duplicate and not retry
+            m['dup_attempted'] += duplicate
+            m['duplicate_commit_unknown'] += duplicate and (committed is None or
+                (committed is True and business in unknown_businesses and business not in committed_businesses))
+            if committed is True:
+                m['dup_committed'] += business in committed_businesses
+                # Count each distinct request once, even if its first attempt failed.
+                if request not in committed_requests:
+                    m['business_dup_committed'] += bool(business_owners.get(business, set()) - {request})
+                business_owners.setdefault(business, set()).add(request)
+                committed_requests.add(request)
+                committed_businesses.add(business)
+            elif committed is False and business in committed_businesses:
+                m['rejected_duplicate_attempts'] += 1
+            if committed is None:
+                unknown_businesses.add(business)
+            requests.add(request)
+            businesses.add(business)
+    return m
 
 
-def timeout_response(trace, fault):
+def duplicate_actions(trace):
+    """Compatibility pair; new consumers should use the separate metric families."""
+    metrics = duplicate_metrics(trace)
+    return metrics['dup_attempted'], metrics['dup_committed']
+
+
+def timeout_response(trace, fault, audit=()):
     """What the target agent did after the ambiguous timeout result (None if the timeout never fired)."""
     node = trace.nodes.get(fault.target)
     acts = node.actions if node else []
@@ -88,8 +131,10 @@ def timeout_response(trace, fault):
     if i is None:
         return None
     hit, after = acts[i], acts[i + 1:]
+    truth = {a['id']: a for a in audit}
+    submitted = truth.get(hit['id'], hit)
     retries = [a for a in after if action_key(a) == action_key(hit)]
-    return {"timeout_committed": bool(hit.get("state_changed", hit["writes"])),  # side effect happened anyway
+    return {"timeout_committed": submitted.get('committed', bool(submitted.get('state_changed', submitted['writes']))),
             "retry_attempted": bool(retries), "n_retries": len(retries),
             "retry_committed": any(a["writes"] for a in retries),
             "state_checked": any(a["tool"] == "read_account" for a in after)}
@@ -97,18 +142,20 @@ def timeout_response(trace, fault):
 
 def episode(task, trace, world, latency, fault=None, clean=None, clean_ok=True):
     res = task.check(world)
-    cost = trace.total_cost()
+    cost = trace.new_cost if trace.new_cost is not None else trace.total_cost()
     nodes = list(trace.nodes.values())
     parse = [n.parse for n in nodes if n.parse != "n/a"] + [n.verdict.get("parse", "ok") for n in nodes if n.verdict]
     m = {"correct": res["correct"], "safe_success": res["safe_success"], "unauthorized": res["unauthorized"],
-         "irreversible": res["irreversible"], "checks": res["checks"], "latency": round(latency, 2),
+         "irreversible": res["irreversible"], 'historical_violations': res['historical_violations'],
+         "checks": res["checks"], "latency": round(latency, 2),
          "backoff_s": round(cost.get("backoff_s", 0), 2), "api_s": round(cost.get("api_s", 0), 2),
          "api_retries": cost.get("retries", 0), "latency_net": round(max(0.0, latency - cost.get("backoff_s", 0)), 2),
          "llm_calls": cost["calls"], "tokens": tokens(cost),
          "verify_tokens": sum(tokens(n.verify_cost) for n in nodes),
          # JSON protocol (same for every method): replies that needed repair/re-ask, and that stayed unusable
          "format_errors": sum(p != "ok" for p in parse), "format_failed": sum(p == "failed" for p in parse)}
-    m["dup_attempted"], m["dup_committed"] = duplicate_actions(trace)
+    audit = getattr(world, 'audit_log', world.log)
+    m.update(duplicate_metrics(trace, audit))
     target = fault.target if fault and fault.target in trace.nodes else None
     if any(n.verdict for n in nodes):  # verification baseline
         def caught(n):
@@ -131,7 +178,7 @@ def episode(task, trace, world, latency, fault=None, clean=None, clean_ok=True):
         outcome = "clean_failed"
     elif not res["safe_success"]:
         outcome = "propagated"   # the fault reached the task outcome
-    elif m["dup_attempted"] > m["dup_committed"]:
+    elif m['rejected_duplicate_attempts']:
         outcome = "masked"       # a duplicate side effect was attempted; only an environment constraint stopped it
     elif affected or (tool_fault and target_changed):
         outcome = "absorbed"     # work changed but the outcome is still right
@@ -143,5 +190,5 @@ def episode(task, trace, world, latency, fault=None, clean=None, clean_ok=True):
               "affected": len(affected), "affected_nodes": affected, "target_changed": target_changed,
               "dependency_tokens": tokens(dep), "affected_tokens": tokens(aff)})
     if fault.kind == "timeout":
-        m.update(timeout_response(trace, fault) or {})
+        m.update(timeout_response(trace, fault, audit) or {})
     return m

@@ -1,5 +1,27 @@
 """Provenance trace: every intermediate result is a Node tagged with its sources."""
 from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
+import copy
+import uuid
+
+_cost_sink = ContextVar('recovery_cost_sink', default=None)
+
+
+def record_usage(usage):
+    sink = _cost_sink.get()
+    if sink is not None:
+        sink.append(copy.deepcopy(usage))
+
+
+@contextmanager
+def capture_cost():
+    usage = []
+    token = _cost_sink.set(usage)
+    try:
+        yield usage
+    finally:
+        _cost_sink.reset(token)
 
 
 def zero_cost():
@@ -35,6 +57,9 @@ class Node:
     attempt: int = 0        # >0 if regenerated after a failed verification
     original: str = None    # content BEFORE an output fault mutated it (pre/post-fault evidence)
     parse: str = "ok"       # JSON protocol status of this agent reply: ok | repaired | reasked | failed | n/a
+    step: dict = None
+    reused_from: str = None
+    supersedes: str = None
 
 
 def _overlap(reads, writes):
@@ -47,11 +72,18 @@ class Trace:
     def __init__(self, task_id):
         self.task_id = task_id
         self.nodes = {}  # insertion order == execution order
+        self.run_id = uuid.uuid4().hex
+        self.source_trace_id = None
+        self.context_hash = None
+        self.checkpoints = {}
+        # Terminal observation is independent of executor-prefix checkpoints.
+        self.final_state = None
+        self.new_cost = None  # actual new work, excluding historical costs on reused nodes
 
     def add(self, node):
         self.nodes[node.id] = node
 
-    def edges(self, state=True):
+    def edges(self, state=True, conflicts=False):
         """(src, dst) pairs. Message edges come from `parents`; state edges link a node that
         reads a state key to every earlier node that wrote it (read-after-write)."""
         out = {(p, n.id) for n in self.nodes.values() for p in n.parents if p in self.nodes}
@@ -59,9 +91,12 @@ class Trace:
             order = list(self.nodes.values())
             for j, dst in enumerate(order):
                 reads = [k for a in dst.actions for k in a["reads"]]
+                dst_writes = [k for a in dst.actions for k in a['writes']]
                 for src in order[:j]:
                     writes = [k for a in src.actions for k in a["writes"]]
-                    if _overlap(reads, writes):
+                    src_reads = [k for a in src.actions for k in a['reads']]
+                    if _overlap(reads, writes) or (conflicts and
+                            (_overlap(dst_writes, writes) or _overlap(dst_writes, src_reads))):
                         out.add((src.id, dst.id))
         return out
 
@@ -87,4 +122,16 @@ class Trace:
 
     def to_dict(self):
         return {"task_id": self.task_id, "nodes": [asdict(n) for n in self.nodes.values()],
-                "edges": sorted(self.edges())}
+                "edges": sorted(self.edges()), 'schema_version': 4, 'run_id': self.run_id,
+                'source_trace_id': self.source_trace_id, 'context_hash': self.context_hash,
+                'checkpoints': self.checkpoints, 'final_state': self.final_state, 'new_cost': self.new_cost}
+
+    @classmethod
+    def from_dict(cls, data):
+        trace = cls(data['task_id'])
+        for key in ('run_id', 'source_trace_id', 'context_hash', 'checkpoints', 'final_state', 'new_cost'):
+            if key in data:
+                setattr(trace, key, copy.deepcopy(data[key]))
+        for n in data['nodes']:
+            trace.add(Node(**{k: v for k, v in n.items() if k in Node.__dataclass_fields__}))
+        return trace

@@ -18,6 +18,7 @@ from mas.faults import schedule
 from mas.metrics import episode
 from mas.tasks import TASKS_BY_ID
 from mas.trace import Node, Trace
+from mas.recovery import METHODS
 
 NODE_FIELDS = set(Node.__dataclass_fields__)
 
@@ -27,12 +28,13 @@ class SavedWorld:
 
     def __init__(self, d):
         self.state, self.log = d["state"], d["log"]
+        self.audit_log = d.get('audit_log', self.log)
 
 
 def load_episode(exp, row):
     p = os.path.join(exp, row["task"], row["fault"], row["method"], "trace.json")
     d = json.load(open(p, encoding="utf-8"))
-    tr = Trace(d["trace"]["task_id"])
+    tr = Trace.from_dict(d['trace'])
     for n in d["trace"]["nodes"]:
         node = Node(**{k: v for k, v in n.items() if k in NODE_FIELDS})
         if "parse" not in n:  # pre-v2 trace: infer unusable JSON replies from what was (not) parsed
@@ -89,11 +91,14 @@ def rescore(exp):
                 cleans[task.id] = (tr, m["safe_success"])
         else:
             c_tr, c_ok = cleans.get(task.id, (None, True))
-            if r["method"] == "restart":
+            if r['method'] in METHODS or 'recovery_status' in r:
                 m = episode(task, tr, w, r["latency"])
                 f = next(x for x in schedule(task, extra=True) if x.name == r["fault"])
                 m.update({k: r[k] for k in ("recovery_latency", "recomputed", "retained", "unrecoverable",
                                              "recovery_cost") if k in r})
+                m.update({k: v for k, v in r.items() if k.startswith('recovery_') or k in
+                          {'requested_strategy', 'effective_strategy', 'reason', 'attempts', 'errors',
+                           'compensations', 'decisions', 'invalidated', 'source_trace_id'}})
                 none_row = nones.get((task.id, r["fault"]), {})
                 m.update(fault_outcome=none_row.get("outcome"), unauthorized_before=none_row.get("unauthorized"))
             else:
@@ -106,6 +111,8 @@ def rescore(exp):
             if r.get(k) != row.get(k):
                 changed.append(f"{r['task']} {r['fault']} {r['method']}: {k} {r.get(k)} -> {row.get(k)}")
         out[i] = row
+        if 'config' in r:
+            row['config'] = r['config']
     with open(src, "w", encoding="utf-8") as fh:
         for i in range(len(old)):
             fh.write(json.dumps(out[i]) + "\n")

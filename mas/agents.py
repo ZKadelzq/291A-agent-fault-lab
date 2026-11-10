@@ -2,10 +2,12 @@
 import json
 import re
 import time
+from pathlib import Path
 
 from . import llm
 from .env import EXEC_TOOLS, RESEARCH_TOOLS, schemas
-from .trace import Node, add_cost, zero_cost
+from .trace import Node, add_cost, zero_cost, record_usage
+from .plan import normalize_steps, plan_error, instruction, digest
 
 RESEARCHER = """You are the Researcher agent in a multi-agent financial assistant (Researcher -> Planner -> Executor).
 Research the stock you are given: call lookup_stock and get_news, then reply with ONLY a JSON object:
@@ -14,9 +16,16 @@ Research the stock you are given: call lookup_stock and get_news, then reply wit
 PLANNER = """You are the Planner agent in a multi-agent financial assistant (Researcher -> Planner -> Executor).
 You receive the user task and the Researcher's reports. You cannot call tools; an Executor agent with
 trading tools (verify_kyc, buy, set_stop_loss, write_file, read_account, ...) carries out your plan one step at a time.
-Reply with ONLY a JSON object: {"steps": [{"instruction": str, "uses": [str]}]}
+Reply with ONLY a JSON object: {"steps": [{"op": str, "args": object,
+"requires": [str], "depends_on": [int], "uses": [str]}]}.
+Allowed operation arguments:
+verify_kyc: {"client_id": str}; buy: {"ticker": str, "amount_usd": number};
+set_stop_loss: {"ticker": str, "pct": number}; write_file: {"path": str, "content": str};
+read_account: {}; sell: {"ticker": str, "shares": number};
+send_email: {"to": str, "subject": str, "body": str}; transfer_funds: {"to_account": str, "amount_usd": number}.
+requires may contain "kyc" or "position:TICKER". depends_on lists earlier zero-based step indices.
 - Apply every selection criterion in the task exactly, checking each criterion against the reports.
-- Each instruction is ONE self-contained action with all concrete values (client id, ticker, dollar amount, percent, file path).
+- Each step is ONE self-contained operation with exact argument names and concrete values. Do not output instruction text.
 - "uses" lists the ids of the research reports the step relies on (e.g. ["research:AAPL"]), or [] if none."""
 
 EXECUTOR = """You are the Executor agent in a multi-agent financial assistant. You act on the account of client {client}.
@@ -87,9 +96,7 @@ def _valid_research(d):
 
 
 def _valid_plan(d):
-    steps = d.get("steps") if isinstance(d, dict) else None
-    if not isinstance(steps, list) or not any(isinstance(x, dict) and x.get("instruction") for x in steps):
-        return 'expected {"steps": [{"instruction": str, "uses": [str]}, ...]} with at least one step'
+    return plan_error(d)
 
 
 def _valid_verdict(d):
@@ -105,6 +112,7 @@ def run_agent(system, user, tools, world, node_id, max_turns=8, messages=None):
     final = "ERROR: max turns reached"
     for _ in range(max_turns):
         msg, usage = llm.chat(msgs, schemas(tools) if tools else None)
+        record_usage(usage)
         cost = add_cost(cost, usage)
         entry = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -155,19 +163,35 @@ def plan(task, research_nodes):
     reports = "\n\n".join(f"[{n.id}]\n{n.content}" for n in research_nodes)
     user = f"Task: {task.instruction}\n\nResearch reports:\n{reports}"
     text, data, status, msgs, actions, cost = run_json_agent(PLANNER, user, [], None, "plan", _valid_plan)
-    steps = [s for s in (data or {}).get("steps", []) if isinstance(s, dict) and s.get("instruction")][:12]
-    if status == "repaired":  # downstream readers (verifier) see the well-formed plan; the raw reply is in messages
-        text = json.dumps(data)
+    # IDs belong to the runtime, not to model-generated text.
+    steps = normalize_steps([{k: v for k, v in s.items() if k != 'logical_id'} for s in data['steps']]) if status != 'failed' else []
+    if steps:
+        text = json.dumps({'steps': steps})
     return Node("plan", "planner", [n.id for n in research_nodes], text, steps, cost=cost, messages=msgs,
                 parse=status)
 
 
 def execute(task, i, step, world):
     nid = f"exec:{i}"
-    text, msgs, actions, cost = run_agent(EXECUTOR.format(client=task.client_id), f"Step: {step['instruction']}",
-                                          EXEC_TOOLS, world, nid)
+    world.operation_id = step['logical_id']
+    try:
+        text, msgs, actions, cost = run_agent(EXECUTOR.format(client=task.client_id), instruction(step),
+                                              EXEC_TOOLS, world, nid)
+    finally:
+        world.operation_id = None
     return Node(nid, "executor", ["plan"], text, uses=list(step.get("uses", [])),
-                actions=actions, cost=cost, messages=msgs, parse="n/a")
+                actions=actions, cost=cost, messages=msgs, parse="n/a", step=step)
+
+
+def config_signature(task=None):
+    """No credentials: reproducible model/prompt/tool/code identity for reuse and resume."""
+    code = {str(p.relative_to(Path(__file__).parent)): p.read_text()
+            for p in sorted(Path(__file__).parent.rglob('*.py'))}
+    return digest({'task': task.instruction if task else None, 'code': code,
+                   'model': llm.MODEL, 'endpoint': llm.BASE_URL, 'temperature': llm.TEMPERATURE,
+                   'reasoning': llm.REASONING_EFFORT, 'extra': llm.EXTRA_BODY,
+                   'max_tokens': llm.MAX_TOKENS, 'no_think': llm.NO_THINK,
+                   'tools': schemas(EXEC_TOOLS + RESEARCH_TOOLS)})
 
 
 def verify(task, node, world, trace):

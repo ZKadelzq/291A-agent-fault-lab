@@ -1,0 +1,62 @@
+name: Tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  deterministic-experiments:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        outcome: [committed, not_committed, unknown]
+    env:
+      OUT: runs/scratch/ci-${{ matrix.outcome }}
+      OUTCOME: ${{ matrix.outcome }}
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Run deterministic experiment matrix (no API)
+        shell: bash
+        run: |
+          if [[ "$OUTCOME" == "committed" ]]; then
+            scope=(--extra-faults)
+          else
+            scope=(--faults E-timeout)
+          fi
+          python tests/offline_smoke.py "${scope[@]}" \
+            --timeout-outcome "$OUTCOME" --cash ample \
+            --methods none,restart,verify,selective,change_aware,reconcile --out "$OUT"
+      - name: Check completeness and analysis pipeline
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['OUT'])
+          rows = [json.loads(line) for line in (root / 'results.jsonl').read_text().splitlines()]
+          expected = 300 if os.environ['OUTCOME'] == 'committed' else 48
+          assert len(rows) == expected
+          assert len(list(root.glob('*/*/*/trace.json'))) == expected
+          assert not (root / 'failures.log').exists()
+          PY
+          python rescore.py "$OUT"
+          python summarize.py "$OUT"
+          python figures.py "$OUT"

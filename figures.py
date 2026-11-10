@@ -23,15 +23,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Patch  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
 
 from analysis import (ACCIDENTAL, ADVERSARIAL, CONTROL, OUTCOMES, faults_in, invalidation_sets, load,  # noqa: E402
-                      load_trace, mean, outcome_counts)
+                      load_trace, mean, outcome_counts, METHOD_ORDER)
 
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
 BLUE, ORANGE, AQUA, GRAY, NEUTRAL = "#2a78d6", "#eb6834", "#1baf7a", "#8f8e88", "#d4d3cd"
 OUT_COL = {"propagated": ORANGE, "masked": "#f5b48f", "absorbed": AQUA, "prevented": BLUE, "ignored": NEUTRAL}
 SHOWN = ("propagated", "masked", "absorbed", "ignored")
 METH_COL = {"none": GRAY, "restart": BLUE, "verify": ORANGE, "selective": AQUA}
+for index, name in enumerate(METHOD_ORDER):
+    METH_COL.setdefault(name, ['#8856a7', '#a6761d', '#e7298a'][index % 3])
 MODEL_COLS = [BLUE, ORANGE, AQUA]
 
 plt.rcParams.update({
@@ -98,10 +101,11 @@ def fig_outcomes(rows, outdir):
 # ---------------------------------------------------------------- fig 4
 def fig_cost(rows, outdir):
     panels = [(t, fs) for t, fs in split_faults(rows) if fs]
+    markers = dict(zip(METHOD_ORDER, ['o', 's', '^', 'D', 'P', 'X']))
     clean = [r["tokens"] for r in rows if r["fault"] == "clean" and r["method"] == "none"]
     fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 3.4), sharey=True, squeeze=False)
     for ax, (title, faults) in zip(axes[0], panels):
-        for m in ("none", "restart", "verify", "selective"):
+        for m in METHOD_ORDER:
             rs = [r for r in rows if r["fault"] in faults and r["method"] == m]
             if not rs:
                 continue
@@ -109,10 +113,10 @@ def fig_cost(rows, outdir):
                 fr = [r for r in rs if r["fault"] == fault]
                 if fr:
                     ax.scatter(mean(r["total_tokens"] for r in fr) / 1000, mean(r["safe_success"] for r in fr),
-                               s=22, color=METH_COL[m], alpha=0.35, linewidths=0)
+                               s=22, color=METH_COL[m], marker=markers.get(m, 'o'), alpha=0.35, linewidths=0)
             x, y = mean(r["total_tokens"] for r in rs) / 1000, mean(r["safe_success"] for r in rs)
-            ax.scatter(x, y, s=90, color=METH_COL[m], edgecolor=SURFACE, linewidth=2, zorder=3)
-            ax.annotate(m, (x, y), xytext=(8, 6), textcoords="offset points", fontsize=9, color=INK)
+            ax.scatter(x, y, s=90, color=METH_COL[m], marker=markers.get(m, 'o'),
+                       edgecolor=SURFACE, linewidth=1, zorder=3)
         if clean:
             ax.axvline(mean(clean) / 1000, color=INK2, linestyle=":", linewidth=1)
             ax.text(mean(clean) / 1000, 0.02, " clean run", fontsize=7.5, color=INK2, va="bottom")
@@ -122,9 +126,12 @@ def fig_cost(rows, outdir):
         ax.set_axisbelow(True)
         ax.set_title(title)
     axes[0][0].set_ylabel("safe success rate")
-    fig.suptitle("Cost vs. correctness of the recovery baselines (big dot = mean over faults, small = per fault)",
+    fig.suptitle("Cost vs. safety (large marker = mean over faults, small = per fault)",
                  x=0.01, ha="left", y=1.03, fontsize=10, fontweight="bold")
-    fig.tight_layout()
+    handles = [Line2D([], [], color=METH_COL[m], marker=markers.get(m, 'o'), linestyle='None', label=m)
+               for m in METHOD_ORDER if any(r['method'] == m and r['fault'] != 'clean' for r in rows)]
+    fig.legend(handles=handles, loc='lower center', ncol=min(6, len(handles)), fontsize=8)
+    fig.tight_layout(rect=(0, 0.10, 1, 1))
     save(fig, outdir, "fig4_cost")
 
 

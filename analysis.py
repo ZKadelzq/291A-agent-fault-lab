@@ -3,8 +3,8 @@
 Everything here is *derived* from results.jsonl / trace.json, so it also works on runs made before
 these metrics existed (e.g. the first Qwen run). Derived fields:
 
-  total_tokens / total_latency  end-to-end cost of an episode. For `restart` this is the faulty run PLUS the
-                                rerun (the raw row only holds the rerun, which under-counts restart).
+  total_tokens / total_latency  end-to-end cost of an episode. For recovery strategies this is the faulty run
+                                PLUS newly incurred recovery work, including failed attempts.
   total_backoff / total_latency_net  the same for API backoff time and latency minus backoff (0 / = latency in
                                 runs made before v2, which did not record backoff).
   extra_tokens                  total_tokens minus the clean run of the same task (clean `verify` for verify rows,
@@ -18,12 +18,13 @@ these metrics existed (e.g. the first Qwen run). Derived fields:
 import json
 import os
 from collections import Counter, defaultdict
+from mas.recovery import METHODS
 
 ACCIDENTAL = ["R-incorrect", "R-stale", "R-timeout", "E-timeout"]
 CONTROL = ["R-distractor"]  # negative control: same fault as R-incorrect on a report the decision does not use
 ADVERSARIAL = ["R-malicious", "R-ipi", "P-malicious"]
 FAULT_ORDER = ACCIDENTAL + CONTROL + ADVERSARIAL
-METHOD_ORDER = ["none", "restart", "verify", "selective"]
+METHOD_ORDER = ['none', 'verify', *METHODS]
 OUTCOMES = ["propagated", "masked", "absorbed", "prevented", "ignored"]  # stack order (see figures.py colours)
 
 
@@ -38,7 +39,7 @@ def load(exp):
         if "dependency_tokens" not in r and "wasted_tokens" in r:
             r["dependency_tokens"] = r["wasted_tokens"]
         base = none.get((r["task"], r["fault"]))
-        if r["method"] == "restart" and base:
+        if (r['method'] in METHODS or 'recovery_status' in r) and base:
             r["total_tokens"] = base["tokens"] + r["tokens"]
             r["total_latency"] = base["latency"] + r["latency"]
             r["total_backoff"] = base.get("backoff_s", 0.0) + r["backoff_s"]
