@@ -43,6 +43,27 @@ Restart and selective each stop six times; four of those stopped rows retain an 
 
 Relative to restart, mean end-to-end token use decreases by **6.6%** for selective, **21.3%** for change-aware, and **43.0%** for reconcile. These averages include all faults and the negative control, not only successful recoveries. Reconcile uses deterministic compensation and report generation instead of an LLM executor; its advantage includes fewer model calls and avoiding executor argument deviations, not only better dependency selection.
 
+### Work retained and recovery latency
+
+These means use all 48 main-matrix fault rows per method, including stopped attempts and fallback costs. A stopped attempt has zero published retained/recomputed nodes even when it consumed model work during a failed candidate; its time and tokens still count.
+
+| Recovery method | Mean recomputed nodes | Mean retained nodes | Mean recovery seconds | Irreversible external effects across 48 rows |
+|---|---:|---:|---:|---:|
+| restart | 7.71 | 0.00 | 26.1 | 10 |
+| selective | 5.21 | 2.50 | 24.3 | 10 |
+| change_aware | 4.10 | 4.35 | 17.0 | 10 |
+| reconcile | 1.62 | 2.88 | 4.9 | 10 |
+
+`reconcile` also performs compensation steps, so its low recomputed-node count is not a complete measure of work. The identical 10 historical external effects per method are paired observations from the shared faulty baselines; account reconstruction cannot undo them. Verification is a separate preventive run: the main-matrix saved rows record 30 fault detections and zero verifier false alarms on six clean controls, but six of those detections concern the harmless `R-distractor` fault. Verification does not inspect executor side effects. These detection counts must not be presented as recovery successes.
+
+### Reuse integrity, dependency precision, and tracking cost
+
+The read-only [provenance audit](../PHASE2_PROVENANCE.md), reproduced by [`analyze_phase2_provenance.py`](../../analyze_phase2_provenance.py), checks each retained node against its paired faulty source and clean control. All **120 selective retained nodes** preserve source identity and recorded content/actions; 114 have exactly matching content and parsed data in the separately generated clean control. Exact clean-text equality is only a diagnostic, because independent model calls can phrase equivalent work differently. The recovery runtime additionally checks receipts, checkpoints, the executor-visible step contract, and final state before publication. It does not prove that a reused result would be semantically correct under an unobserved change in the outside world.
+
+The runtime's message-plus-state graph exposes a mean **4.83 downstream nodes** per faulty source, versus **4.67** using message edges alone. A diagnostic graph that drops plan-to-executor edges in favor of declared `uses` is smaller but misses **162** downstream nodes across 48 faults; even adding shared-state edges leaves **120** misses. This is why `uses` cannot safely replace plan edges when a repaired plan can change an operation. Across 430 source nodes, compact provenance fields occupy **50,451 bytes** and saved checkpoints **51,788 bytes**; see the audit for scope, timing method, and limits. These post-hoc measurements are not live instrumentation overhead.
+
+Unrecorded account drift is a hard boundary: `validate_source` compares the saved terminal state and receipts with the current environment before any strategy builds a candidate. A parameterized deterministic test changes cash after the source trace and confirms that all four recovery strategies stop with `STATE_CONFLICT`, zero new model tokens, no new actions, and no overwrite. This is safe refusal, **not** successful adaptation or replanning after an external change. A future system would need a fresh authoritative snapshot and a new plan with explicit reconciliation of already committed effects.
+
 ### Final safety by fault
 
 | Fault | none | verify | restart | selective | change_aware | reconcile |

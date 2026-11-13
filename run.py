@@ -32,6 +32,21 @@ from mas.workflow import run_workflow
 HARNESS = "v4-recovery-evidence"
 
 
+def expected_episode_keys(tasks, faults, methods, extra=False):
+    """The exact result grid, including clean controls and the mandatory faulty run."""
+    keys = {(t.id, 'clean', 'none') for t in tasks}
+    if 'verify' in methods:
+        keys.update((t.id, 'clean', 'verify') for t in tasks)
+    fault_methods = {'none', *[m for m in METHODS if m in methods]}
+    if 'verify' in methods:
+        fault_methods.add('verify')
+    for task in tasks:
+        for fault in schedule(task, extra):
+            if faults is None or fault.name in faults:
+                keys.update((task.id, fault.name, method) for method in fault_methods)
+    return keys
+
+
 def experiment_config():
     return {'signature': config_signature(), 'cash_mode': tasks_mod.CASH_MODE,
             'harness': HARNESS, 'recovery_fallbacks': 1,
@@ -177,6 +192,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", default="all", help="comma-separated task ids or 'all'")
     ap.add_argument("--faults", default="all", help="comma-separated fault names or 'all'")
+    ap.add_argument('--clean-only', action='store_true', help='run only clean controls (for model preflight)')
     ap.add_argument("--methods", default="none,restart,verify", help=','.join(['none', 'verify', *METHODS]))
     ap.add_argument("--out", default=default_output(),
                     help='output directory; defaults to runs/phase2-<model>-<timestamp>-<id> (offline: runs/scratch)')
@@ -192,13 +208,24 @@ def main():
     a = ap.parse_args()
     tasks_mod.CASH_MODE = a.cash
     faults_mod.TIMEOUT_OUTCOME = a.timeout_outcome
-    tasks = TASKS if a.tasks == "all" else [TASKS_BY_ID[t] for t in a.tasks.split(",")]
-    faults = None if a.faults == "all" else set(a.faults.split(","))
+    task_ids = [t.id for t in TASKS] if a.tasks == 'all' else a.tasks.split(',')
+    if not task_ids or len(task_ids) != len(set(task_ids)) or set(task_ids) - TASKS_BY_ID.keys():
+        ap.error('tasks must be distinct known task IDs')
+    tasks = [TASKS_BY_ID[t] for t in task_ids]
+    if a.clean_only and a.faults != 'all':
+        ap.error('--clean-only cannot be combined with --faults')
+    faults = set() if a.clean_only else None if a.faults == 'all' else set(a.faults.split(','))
     extra = a.extra_faults or bool(faults and "R-distractor" in faults)  # naming the control is enough
     methods = set(a.methods.split(","))
+    if a.workers < 1:
+        ap.error('--workers must be positive')
     unknown = methods - {'none', 'verify', *METHODS}
     if unknown:
         ap.error('unknown methods: ' + ','.join(sorted(unknown)))
+    available_faults = {f.name for task in tasks for f in schedule(task, extra)}
+    if faults is not None and faults - available_faults:
+        ap.error('unknown faults: ' + ','.join(sorted(faults - available_faults)))
+    expected_keys = expected_episode_keys(tasks, faults, methods, extra)
     config = experiment_config()
     selection = {'tasks': sorted(t.id for t in tasks),
                  'faults': sorted({f.name for t in tasks for f in schedule(t, extra)
@@ -235,9 +262,14 @@ def main():
                 for f in schedule(t, extra) if faults is None or f.name in faults]
         faulty = list(ex.map(lambda j: safe(run_fault, f"{j[0].id} {j[1].name}", *j, methods, a.out, a.resume), jobs))
     results = [c[2] for c in cleans if c] + [r for r in faulty if r]
+    rows = [row for group in results for row in group]
     with open(os.path.join(a.out, "results.jsonl"), "w") as f:
-        for row in (r for rows in results for r in rows):
+        for row in rows:
             f.write(json.dumps(row) + "\n")
+    actual_keys = [(r['task'], r['fault'], r['method']) for r in rows]
+    if not failures and (len(actual_keys) != len(expected_keys) or set(actual_keys) != expected_keys):
+        failures.append(f'incomplete result grid: expected {len(expected_keys)} distinct rows, '
+                        f'got {len(actual_keys)} rows and {len(set(actual_keys))} distinct keys')
     s = llm.STATS
     print(f"\nwall={time.time() - t0:.0f}s calls={s['calls']} prompt_tok={s['prompt_tokens']} "
           f"completion_tok={s['completion_tokens']} (reasoning {s['reasoning_tokens']}) retries={s['retries']} "

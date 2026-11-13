@@ -172,6 +172,13 @@ Completed real-model runs; see the [consolidated analysis](runs/phase2-muse-glim
 | [phase2-etimeout-not-committed-muse-glimmer-30b](runs/phase2-etimeout-not-committed-muse-glimmer-30b/summary.md) | T1–T6, E-timeout not submitted | 48 |
 | [phase2-etimeout-unknown-muse-glimmer-30b](runs/phase2-etimeout-unknown-muse-glimmer-30b/summary.md) | T1–T6, E-timeout status unavailable | 48 |
 
+The [complete-matrix audit](runs/PHASE2_AUDIT.md) independently checks every result row against its trace and
+confirms that all three runs use the same model and configuration apart from the intended timeout outcome.
+The [provenance and reuse audit](runs/PHASE2_PROVENANCE.md) checks retained-node source integrity, compares
+dependency graphs, and reports offline metadata size and graph-analysis timing. Reproduce it with
+`python analyze_phase2_provenance.py --out runs/PHASE2_PROVENANCE.md`; the timing is a saved-trace
+microbenchmark, not live capture overhead.
+
 Phase 2 compares six methods on the same Researcher → Planner → Executor tasks:
 
 | Method | What it does |
@@ -228,6 +235,71 @@ These commands default to one worker. Add `--workers 2` (or more) to run task/fa
 higher concurrency can increase API rate-limit waits. `--cash ample` ensures sufficient funds for a duplicate
 buy to commit, so insufficient cash does not hide the fault.
 
+After generating all three runs, `audit_phase2.py` checks the exact 300/48/48 episode grids, the manifest in
+every row, and a consistent real model/configuration across runs. It writes a paired cost and safety comparison:
+
+```bash
+python audit_phase2.py \
+  --committed runs/phase2-muse-glimmer-30b \
+  --not-committed runs/phase2-etimeout-not-committed-muse-glimmer-30b \
+  --unknown runs/phase2-etimeout-unknown-muse-glimmer-30b \
+  --out runs/PHASE2_AUDIT.md
+```
+
+#### Nautilus GPU alternative
+
+When the course API is unavailable, `infra/nautilus-phase2.yaml` runs the same 396-episode matrix on one
+dedicated A100 in the authorized `ecepxie` namespace with the separate open-weight
+[`qwen3:30b-instruct`](https://ollama.com/library/qwen3:30b-instruct) model. If that model is too slow to
+transfer or the task budget requires a smaller model, `infra/nautilus-phase2-4b.yaml` uses
+[`qwen3:4b-instruct`](https://ollama.com/library/qwen3:4b-instruct) on the **same task-owned PVC**. Run one Job
+at a time. These runs do **not** reproduce Muse Glimmer results. Each Job requires all six clean tasks to pass,
+records the model digest and source commit, then runs and audits the three matrices. Neither Job modifies other
+jobs or volumes.
+
+```bash
+git fetch origin phase_2
+git diff origin/phase_2 HEAD > /tmp/cse291-phase2.patch
+kubectl --context nautilus -n ecepxie create configmap cse291-phase2-patch \
+  --from-file=phase2.patch=/tmp/cse291-phase2.patch \
+  --from-file=nautilus_phase2_checkout.sh=scripts/nautilus_phase2_checkout.sh \
+  --dry-run=client -o yaml | kubectl --context nautilus -n ecepxie apply -f -
+kubectl --context nautilus -n ecepxie apply -f infra/nautilus-phase2.yaml
+kubectl --context nautilus -n ecepxie logs -f job/cse291-phase2-qwen30b -c runner
+```
+
+The ConfigMap carries the tested local commit when the shared GitHub branch cannot be pushed. Each Job clones
+`phase_2` and applies a nonempty patch before running; an empty patch is valid after the PR is merged. The
+checkout stamp, `source_commit-<slug>.txt`, and `source_patch_sha256-<slug>.txt` identify the exact source.
+If the shared branch advances, regenerate and validate the patch before submitting a **new** job.
+
+**Resume an interrupted Job:** keep its PVC, checkout, ConfigMap patch, and model tag unchanged. Delete only
+the stopped Job, set `PHASE2_RESUME` to `'1'` in its manifest, and apply that manifest again. The checkout
+helper verifies the original commit, patch and working diff before reuse; the runner checks the model digest,
+then passes `--resume` only to result directories that already have both run metadata files. Completed
+episodes are reused by `run.py`; a matrix that had not started runs normally. A changed source or model
+stops instead of mixing results. Keep `PHASE2_RESUME: '0'` for a new Job and use a fresh checkout/output
+location for an independent experiment. The same procedure applies to the 4B manifest.
+
+For example, after a **stopped** 30B Job, change `value: '0'` to `value: '1'` for `PHASE2_RESUME` in
+`infra/nautilus-phase2.yaml`, then run:
+
+```bash
+kubectl --context nautilus -n ecepxie delete job cse291-phase2-qwen30b --wait=true
+kubectl --context nautilus -n ecepxie apply -f infra/nautilus-phase2.yaml
+```
+
+Do not recreate the ConfigMap with a different patch for that resume. The Job deletion leaves its PVC and
+result directories intact. Use `cse291-phase2-qwen4b` and its manifest for a stopped 4B Job.
+
+The runner waits after writing `/work/READY_TO_COPY-<slug>`, so the result files can be copied from its pod
+before it exits. Copy the three `phase2-<slug>-*` directories, `PHASE2_AUDIT-<slug>.md`,
+`model_identity-<slug>.json`, `source_checkout-<slug>.txt`, and `source_commit-<slug>.txt`;
+then create `/work/COPIED_TO_LOCAL-<slug>` in the
+runner container. The slug is `qwen3-30b-instruct` or `qwen3-4b-instruct`.
+Only commit the results after checking the audit and summaries. The PVC remains available for an interrupted
+run; delete it only after the copied results are verified.
+
 ### Small live-model trial (optional)
 
 Use this before a full run to check your API configuration and inspect one recovery case.
@@ -267,6 +339,7 @@ include `--methods` as shown above to compare all Phase 2 strategies. Use `pytho
 |---|---|---|
 | `--tasks` | `all` (T1–T6) | Comma-separated task IDs, e.g. `T1,T3`, restrict the tasks. |
 | `--faults` | `all` (7 standard faults) | Comma-separated names, e.g. `R-incorrect,E-timeout`, restrict faults. See the fault table above. |
+| `--clean-only` | Off | Run only clean controls, useful for testing a new model before the full matrix. |
 | `--extra-faults` | Off | Adds `R-distractor` to the available fault set. With an explicit `--faults` list, that list still filters the set. Naming `R-distractor` directly also enables it. |
 | `--methods` | `none,restart,verify` | Comma-separated methods from the table above. `none` always runs because recovery needs its faulty trace, even if omitted from this list. |
 | `--cash` | `TASK_CASH` from environment, otherwise `legacy` | `legacy`: budget + $5,000; `ample`: twice the budget. Use `ample` for the duplicate-buy experiment. |

@@ -133,8 +133,11 @@ def step_smoke(a, env, run_dir):
     """Clean baseline on every task (no faults, ~6 episodes). Faults on a task whose clean run fails are all
     `clean_failed`, so this shows up front how much of the full run will be usable."""
     out = os.path.join(os.path.dirname(run_dir), os.path.basename(run_dir).replace("phase1-", "smoke-", 1))
-    sh([sys.executable, "run.py", "--tasks", a.tasks, "--faults", "_none_", "--methods", "none",
-        "--workers", str(a.workers), "--out", out], env)
+    cmd = [sys.executable, "run.py", "--tasks", a.tasks, "--clean-only", "--methods", "none",
+           "--workers", str(a.workers), "--out", out]
+    if os.path.exists(os.path.join(out, 'manifest.json')):
+        cmd.append('--resume')
+    sh(cmd, env)
     rows = [json.loads(l) for l in open(os.path.join(out, "results.jsonl"))]
     clean = sorted((r for r in rows if r["fault"] == "clean" and r["method"] == "none"), key=lambda r: r["task"])
     ok = [r for r in clean if r["correct"]]
@@ -189,8 +192,10 @@ def explain_failure(path):
 
 
 def step_full(a, env, run_dir):
-    cmd = [sys.executable, "run.py", "--methods", a.methods, "--workers", str(a.workers), "--resume",
+    cmd = [sys.executable, "run.py", "--methods", a.methods, "--workers", str(a.workers),
            "--out", run_dir, "--tasks", a.tasks, "--faults", a.faults]
+    if os.path.exists(os.path.join(run_dir, 'manifest.json')):
+        cmd.append('--resume')
     if a.extra_faults:
         cmd.append("--extra-faults")
     sh(cmd, env)

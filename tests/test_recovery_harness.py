@@ -10,7 +10,18 @@ from mas.faults import Fault, schedule
 from mas.recovery import METHODS
 from mas.tasks import TASKS
 from rescore import rescore
-from run import run_clean, run_fault, load_row
+from run import expected_episode_keys, run_clean, run_fault, load_row
+
+
+def test_full_phase2_grid_has_the_documented_episode_counts():
+    methods = {'none', 'restart', 'verify', 'selective', 'change_aware', 'reconcile'}
+    committed = expected_episode_keys(TASKS, None, methods, extra=True)
+    timeout = expected_episode_keys(TASKS, {'E-timeout'}, methods)
+    assert len(committed) == 300
+    assert len(timeout) == 48
+    assert {key for key in committed if key[1] == 'clean'} == {
+        (t.id, 'clean', method) for t in TASKS for method in ('none', 'verify')}
+    assert len({key for key in timeout if key[1] == 'E-timeout'}) == 36
 
 
 def test_saved_results_resume_and_rescore(tmp_path, monkeypatch):

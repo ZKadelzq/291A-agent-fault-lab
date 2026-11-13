@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cse291-phase2-qwen30b
+  namespace: ecepxie
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 60Gi
+  storageClassName: rook-cephfs
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cse291-phase2-qwen30b
+  namespace: ecepxie
+  labels:
+    app: cse291-phase2
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app: cse291-phase2
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: ollama
+          restartPolicy: Always
+          image: ollama/ollama:latest
+          command: [ollama, serve]
+          env:
+            - name: OLLAMA_HOST
+              value: 127.0.0.1:11434
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: '16384'
+            - name: OLLAMA_NUM_PARALLEL
+              value: '2'
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: '1'
+            - name: OLLAMA_KEEP_ALIVE
+              value: '-1'
+          resources:
+            requests:
+              cpu: '4'
+              memory: 40Gi
+              nvidia.com/a100: '1'
+            limits:
+              cpu: '4'
+              memory: 40Gi
+              nvidia.com/a100: '1'
+          volumeMounts:
+            - name: work
+              mountPath: /root/.ollama
+              subPath: ollama
+      containers:
+        - name: runner
+          env:
+            - name: PHASE2_REPO_DIR
+              value: /work/291A-agent-fault-lab
+            - name: PHASE2_SLUG
+              value: qwen3-30b-instruct
+            - name: PHASE2_RESUME
+              value: '0'
+          image: python:3.11-bookworm
+          command: [/bin/bash, -lc]
+          args:
+            - >-
+              apt-get update -qq && apt-get install -y -qq git >/dev/null &&
+              bash /config/nautilus_phase2_checkout.sh &&
+              cd /work/291A-agent-fault-lab &&
+              python -m pip install -q -r requirements-dev.txt &&
+              bash scripts/nautilus_phase2_runner.sh
+          resources:
+            requests:
+              cpu: '2'
+              memory: 8Gi
+            limits:
+              cpu: '2'
+              memory: 8Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: code-patch
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: cse291-phase2-qwen30b
+        - name: code-patch
+          configMap:
+            name: cse291-phase2-patch

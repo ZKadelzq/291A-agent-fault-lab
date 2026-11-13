@@ -43,8 +43,8 @@ This is cheaper than a full restart and safer than verifying everything, but som
 - 3.4 Provenance tracking: Node = result plus sources. Three edge types: message, declared `uses`, shared-state read-after-write.
 - 3.5 Fault model: table of 7 faults (kind, accidental/adversarial, stage, mechanism). Faults fire once and their identity is supplied to recovery.
 - 3.6 Baselines: full restart (rollback to the initial snapshot); always-verify (LLM verifier after each report and the plan, regenerate on FAIL).
-- 3.7 **[Phase 2] Selective recovery**: invalidation set = descendants of the faulty node; state restoration (snapshots/compensation); rerun with `reuse`. [TODO: final design, pseudo-code, which edge types were used]
-- 3.8 **[Phase 2] Changed environment and irreversible actions**: [TODO: what cannot be rolled back, how it is detected and reported]
+- 3.7 **[Phase 2] Selective recovery**: given the tagged faulty node, compute its descendants using message-parent plus shared-state read-after-write edges. Reuse independent research and a receipt/checkpoint-validated execution prefix; recompute the faulty source, plan, and affected suffix on an isolated world branch. Check the candidate's operation contract and final state, then publish atomically; otherwise stop or use the explicit restart fallback. `change_aware` revalidates a longer common prefix; `reconcile` computes exact state deltas. See `mas/recover/` and `runs/phase2-muse-glimmer-30b/analysis.md`.
+- 3.8 **[Phase 2] Changed environment and irreversible actions**: compare the saved terminal state and receipts with the live source before recovery. Unrecorded drift yields `STATE_CONFLICT`, no new actions, and no publication (deterministic test on all four strategies). Unknown order status yields `EFFECT_UNKNOWN`; external email/transfers survive rollback and remain unsafe. This implementation does not replan from arbitrary external drift.
 
 ## 4. Experimental Setup
 - Model: Muse Glimmer 30B via UCSD TritonAI (`api-muse-glimmer-30b`), temperature 0.
@@ -76,16 +76,15 @@ This is cheaper than a full restart and safer than verifying everything, but som
   declared `uses` invalidate 2.5 for R-incorrect, i.e. they under-invalidate when the plan itself changes.
 
 ## 6. Results — Recovery (Phase 1 baselines + Phase 2)
-- Table 3: restart vs. verify vs. selective under identical fault schedules, with columns for recovered correctness, unauthorized,
-  recomputed/retained nodes, recovery latency, tokens, unrecoverable actions. [TODO]
-- Figure 3: cost (tokens or latency) vs. recovered correctness per method. [TODO]
-- Validity of reuse: are reused results identical to a clean run? [TODO]
-- Precision vs. bookkeeping: coarse vs. `uses` vs. +state edges, giving recomputed nodes and tracking overhead (bytes/time). [TODO]
-- Where selective recovery fails: irreversible actions, changed environment, faults that are not visible in the dependency graph. [TODO]
-- Detection vs. recovery: verification as detection (detected/false alarms), kept separate from recovery quality. [TODO]
+- Table 3 data: main-matrix `runs/phase2-muse-glimmer-30b/analysis.md`: per method final safe, direct/fallback/stopped, tokens, latency, mean recomputed/retained, historical external effects. The exact 396-row scope and matched settings are checked in `runs/PHASE2_AUDIT.md`.
+- Cost-versus-safety figure: `runs/phase2-muse-glimmer-30b/figs/fig4_cost.png`; use `safe_success` and show all four recovery strategies, verify, and none.
+- Reuse validity: `runs/PHASE2_PROVENANCE.md` verifies all 120/120 selective retained nodes against source identity and original action receipts; 114/120 have exact clean-control content/data. Explain why clean-text equality is not a semantic oracle. Change-aware retains 209 nodes, including 86 invalidated executor-prefix nodes revalidated against the repaired plan.
+- Precision vs. bookkeeping: across 48 faulty source traces, message-only graph exposes 4.67 downstream nodes/fault; message+state exposes 4.83; `uses`-only misses 162 downstream nodes compared with the runtime graph. Provenance fields: 50,451 compact bytes across 430 source nodes; checkpoints: 51,788 bytes. Post-hoc graph timing in `runs/PHASE2_PROVENANCE.md` is not live tracing overhead.
+- Failure boundaries: irreversible leakage (10 external effects per recovery method on paired sources); unknown order status (24/24 recovery attempts stop); unrecorded state drift (`STATE_CONFLICT` in deterministic tests); T6 strict report-text contract causing conservative stops. Do not count safe but stopped accounts as completed recovery.
+- Detection vs. recovery: the main-matrix verifier flags 30 fault episodes, including six harmless `R-distractor` cases, and has zero false alarms on clean controls. It is a separate preventive run and cannot detect executor timeout effects. Report `safe_success` and published reconstruction separately.
 
 ## 7. Discussion & Limitations
-- Simulated tools, small task family, a single model; injection is post hoc and fires once. [TODO]
+- Simulated tools, six tasks, one real model, one run per cell, and one-shot post-hoc injection. No confidence intervals or real trading adapter; price and account drift outside the trace are refused, not adapted to.
 - No guarantee against arbitrary malicious agents (expected by the spec).
 
 ## 8. Experience (required by the course for the final report)
@@ -103,10 +102,10 @@ This is cheaper than a full restart and safer than verifying everything, but som
 | Oct 10 | repo, workflow, harness, baselines running (done) | [TODO] |
 | Oct 20 | first full Phase 1 grid, tables and figures (done) | [TODO] |
 | Oct 28 | **Phase 1 report + code due**; final Muse runs (done) | all |
-| Nov 10 | selective recovery v1: invalid set, per-node snapshots, rerun with reuse | [TODO] |
-| Nov 17 | reuse validity check vs. clean runs; compensating actions | [TODO] |
-| Nov 24 | changed-environment cases (irreversible effects, drift); precision vs. tracking overhead | [TODO] |
-| Dec 1 | final experiments frozen: selective vs. restart vs. verify, same fault schedules | [TODO] |
+| Nov 10 | selective recovery v1: invalid set, per-node snapshots, rerun with reuse | implemented in `mas/recover/`; see Phase 2 analysis |
+| Nov 17 | reuse validity check vs. clean runs; compensating actions | completed early; see `runs/PHASE2_PROVENANCE.md` and reconcile strategy |
+| Nov 24 | changed-environment cases (irreversible effects, drift); precision vs. tracking overhead | completed early as fail-closed drift test plus saved-trace audit; live capture overhead remains unmeasured |
+| Dec 1 | final experiments frozen: selective vs. restart vs. verify, same fault schedules | 396 episodes complete and audited early; final paper still to assemble |
 | Dec 10 | **final report + code due** | all |
 
 ## Phase 1 report (1–2 pages) = a short cut of the sections above

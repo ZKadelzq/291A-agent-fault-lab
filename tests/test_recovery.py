@@ -96,15 +96,20 @@ def test_legacy_fallback_is_bounded_and_accounted():
     assert stats['recovery_tokens'] == tokens(new.total_cost())
 
 
-def test_unlogged_state_change_stops_without_overwrite():
+@pytest.mark.parametrize('method', list(METHODS))
+def test_unlogged_state_change_stops_without_overwrite(method):
     world, trace, f = broken(TASKS[0], 'R-incorrect')
     world.state['cash'] += 17
     before = copy.deepcopy(world.state)
-    _, stats = METHODS['change_aware'](TASKS[0], world, trace, f)
+    log_before = copy.deepcopy(world.log)
+    _, stats = METHODS[method](TASKS[0], world, trace, f)
     assert stats['recovery_status'] == 'stopped'
     assert stats['reason'] == 'STATE_CONFLICT'
-    assert stats['attempts'] == ['change_aware']
+    assert stats['attempts'] == [method]
+    assert stats['recovery_tokens'] == 0
     assert world.state == before
+    assert world.log == log_before
+    assert all(not batch['published'] and not batch['actions'] for batch in stats['recovery_audit'])
 
 
 def test_missing_receipt_stops():
