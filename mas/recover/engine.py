@@ -23,8 +23,16 @@ class RecoveryRuntime:
         self.trace = Trace(ctx.task.id)
         self.trace.source_trace_id = ctx.old_trace.run_id
         self.trace.context_hash = agents.config_signature(ctx.task)
+        self.trace.market_versions = copy.deepcopy(self.world.market_versions)
+        self.trace.news_versions = copy.deepcopy(self.world.news_versions)
+        self.trace.feed_fingerprints = self.world.feed_fingerprints()
         self.decisions = []
+        self.market_changed = set()
+        t0 = time.perf_counter()
         self.invalid = {ctx.target} | ctx.old_trace.descendants(ctx.target)
+        graph_time = time.perf_counter() - t0
+        self._overhead_s = {'market_validation': 0.0, 'reuse_validation': 0.0,
+                            'dependency_analysis': graph_time}
         self.reports, self.steps, self.target, self.prices = [], [], None, {}
         self.new_actions_start = len(self.world.log)
 
@@ -43,6 +51,43 @@ class RecoveryRuntime:
         require(node.parse != 'failed', 'UNUSABLE_AGENT_OUTPUT')
         return node
 
+    def _refresh_market_dependencies(self):
+        """Invalidate old artifacts whose ordinary input revisions changed.
+
+        The feed revision is a simulator-visible ETag, NOT a task checker oracle.
+        Missing revision evidence is fail-closed rather than accepting stale reuse.
+        """
+        start = time.perf_counter()
+        old = self.ctx.old_trace
+        if (old.market_versions is None or old.news_versions is None
+                or old.feed_fingerprints is None):
+            raise RecoveryError('MARKET_VERSION_UNAVAILABLE')
+        for ticker in self.ctx.task.tickers:
+            changed = (old.market_versions.get(ticker) != self.world.market_versions.get(ticker)
+                       or old.news_versions.get(ticker) != self.world.news_versions.get(ticker)
+                       or old.feed_fingerprints.get(ticker)
+                          != self.world.feed_fingerprints([ticker])[ticker])
+            if changed:
+                self.market_changed.add(ticker)
+                nid = f'research:{ticker}'
+                self.invalid.add(nid)
+                self.invalid.update(old.descendants(nid))
+        self._overhead_s['market_validation'] += time.perf_counter() - start
+
+    def prefix(self, limit):
+        """Validate the reusable prefix, including previous market price reads."""
+        start = time.perf_counter()
+        prefix = valid_prefix(self.ctx.old_trace, self.steps, self.world, limit)
+        if self.market_changed:
+            for i in range(prefix):
+                node = self.ctx.old_trace.nodes[f'exec:{i}']
+                if any(any(key == f'market.{t}' for t in self.market_changed)
+                       for a in node.actions for key in a.get('reads', [])):
+                    prefix = i
+                    break
+        self._overhead_s['reuse_validation'] += time.perf_counter() - start
+        return prefix
+
     def prepare(self, restart=False):
         ctx, old = self.ctx, self.ctx.old_trace
         node = old.nodes.get(ctx.target)
@@ -50,6 +95,7 @@ class RecoveryRuntime:
         compatible = old.context_hash == self.trace.context_hash
         if not restart:
             require(compatible, 'CONTEXT_OR_SCHEMA_CHANGED')
+            self._refresh_market_dependencies()
         for ticker in ctx.task.tickers:
             nid = f'research:{ticker}'
             prior = old.nodes.get(nid)
@@ -104,6 +150,10 @@ class RecoveryRuntime:
 
     def validate(self):
         for action in self.world.log[self.new_actions_start:]:
+            if action.get('rejected_contract'):
+                require(action['before'] == action['after'] and action['committed'] is False,
+                        'REJECTED_ACTION_MUTATED', False)
+                continue
             require(not action.get('irreversible'), 'EXTERNAL_OPERATION_BLOCKED', False)
             require(action.get('committed'), 'RECOVERY_ACTION_FAILED')
         if any(n.agent == 'executor' for n in self.trace.nodes.values()):
@@ -141,12 +191,35 @@ def recover(ctx, source, strategy, status_reader=None):
         for u in usage:
             cost = add_cost(cost, u)
         events = copy.deepcopy(runtime.world.log[runtime.new_actions_start:])
-        audit.append({'strategy': selected.name, 'published': failure is None, 'actions': events})
+        violations = []
+        for action in events:
+            if action.get('rejected_contract'):
+                node_id = action['by']
+                expected = (runtime.steps[int(node_id.split(':')[1])]
+                            if node_id.startswith('exec:') else None)
+                actual_args = action['args'] if isinstance(action['args'], dict) else {}
+                want_args = expected['args'] if expected else {}
+                changed_keys = sorted(k for k in set(actual_args) | set(want_args)
+                                      if actual_args.get(k) != want_args.get(k))
+                violations.append({'node': node_id, 'expected_op': expected['op'] if expected else None,
+                                   'actual_op': action['tool'], 'different_args': changed_keys,
+                                   'no_effect': action['before'] == action['after']})
+        audit.append({'strategy': selected.name, 'published': failure is None, 'actions': events,
+                      'contract_violations': violations, 'market_changed': sorted(runtime.market_changed),
+                      'overhead_s': dict(runtime._overhead_s)})
         if failure:
             errors.append(failure.reason)
             if not failure.fallback:
                 break
             continue
+        # World-scoped market revisions are pinned for the candidate. If a concurrent
+        # updater bypassed the per-World protocol, never silently publish its result.
+        if (source.market_versions != runtime.world.market_versions
+                or source.news_versions != runtime.world.news_versions
+                or source.feed_fingerprints() != runtime.world.feed_fingerprints()):
+            # Never publish a candidate made against a different feed revision.
+            errors.append('MARKET_CHANGED_DURING_RECOVERY')
+            break
         source.state = copy.deepcopy(runtime.world.state)
         source.log = copy.deepcopy(runtime.world.log)
         source.audit_log = copy.deepcopy(runtime.world.audit_log)
@@ -170,6 +243,10 @@ def recover(ctx, source, strategy, status_reader=None):
              'compensations': sum(d['decision'] == 'compensated' for d in decisions),
              'unrecoverable': len(source.state['external']), 'decisions': decisions,
              'invalidated': sorted(runtime.invalid),
+             'market_changed': sorted({t for a in audit for t in a.get('market_changed', [])}),
+             'recovery_overhead_s': dict(runtime._overhead_s),
+             'trace_overhead_s': dict(runtime.trace.overhead_s),
              'recovery_status_queries': queries,
-             'recovery_audit': audit, 'source_trace_id': ctx.old_trace.run_id}
+             'recovery_audit': audit, 'source_trace_id': ctx.old_trace.run_id,
+             'contract_violations': [v for entry in audit for v in entry['contract_violations']]}
     return RecoveryResult(result_trace, stats)

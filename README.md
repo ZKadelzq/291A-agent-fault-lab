@@ -424,3 +424,49 @@ unrecorded account drift, including `reconcile`. Irreversible history survives r
 outcomes stop all strategies. The separate retry/duplicate metrics measure behavior, not prevention.
 
 To add a task, extend `TASKS` in `mas/tasks.py`. To add a fault, extend `mas/faults.py`.
+
+## Focused environment-aware recovery extension (after T6 contract patch)
+
+The standard Phase 2 matrix still uses the **unchanged, fixed market**. Each
+`World` now owns its own market/news feed and per-ticker revisions; no experiment
+should mutate the global `mas.env.MARKET` fixture. To construct a controlled
+change *between faulty execution and recovery*, call
+`world.update_market('AAPL', rating='hold')` (or supply `price=200` / `news=...`).
+The old trace holds input revision metadata and feed fingerprints. Recovery
+invalidates the changed ticker's research node and the dependent plan, reruns
+research through regular `lookup_stock`/`get_news` tool calls, and validates
+any reused execution prefix against market price reads and state checkpoints.
+
+**Evaluation policy:** For the controlled simulator, managed trade state can
+be rolled back and re-executed at the recovery epoch. An original purchase at
+an older quote is part of the abandoned simulated branch, *not* a guaranteed
+real-world undo. Already committed external email/transfer effects survive and
+remain unsafe. The checker evaluates portfolio selection/amounts at the pinned
+recovery feed and maintains cash-flow accounting at historical execution prices
+(`trade_net_spent`), not current market value. Reconcile does not make an unsafe
+cross-price sell assumption: on feed drift it uses the bounded Restart fallback.
+The system assumes no concurrent update to the *same* World during recovery;
+per-World isolation permits different episodes to execute in parallel.
+
+Controlled local test (no API key required):
+
+```powershell
+py -m pytest -q --ignore=tests/test_nautilus_resume.py
+py scripts/run_market_drift.py --offline --task T1 --fault E-timeout --ticker AAPL --rating hold --out runs/scratch/drift-rating-v1
+py scripts/run_market_drift.py --offline --task T1 --fault E-timeout --ticker AAPL --price 200 --out runs/scratch/drift-price-v1
+```
+
+The same drift command **without** `--offline` uses the configured Muse endpoint
+and API key from `.env` or the existing process environment. Use a fresh `--out`
+for each test; the new-run artifact does not replace or merge into the 396
+pre-existing fixed-market episodes. Standard matrix comparison remains:
+
+```powershell
+py scripts/run_market_drift.py `
+  --task T1 `
+  --fault E-timeout `
+  --ticker AAPL `
+  --rating hold `
+  --out runs/phase2-muse-drift/t1
+```
+

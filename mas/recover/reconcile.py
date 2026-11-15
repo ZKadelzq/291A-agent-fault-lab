@@ -7,6 +7,12 @@ class Reconcile:
 
     def build(self, ctx, runtime):
         runtime.prepare()
+        # Compensation across market epochs may realize gains/losses; target-state
+        # reconciliation cannot pretend historical buys occurred at today's price.
+        # Let the already-bounded Full Restart fallback handle simulated accounts.
+        if runtime.market_changed:
+            from .contracts import RecoveryError
+            raise RecoveryError('MARKET_DRIFT_RECONCILE_REQUIRES_RESTART')
         w, target = runtime.world, runtime.target
         runtime.observe('read_account', {})
         if ctx.task.client_id not in w.state['kyc_verified']:

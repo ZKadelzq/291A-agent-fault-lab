@@ -1,7 +1,4 @@
 """Conservative recovery: retain research, or a validated pre-fault execution prefix."""
-from .state import valid_prefix
-
-
 class Restart:
     name = 'restart'
 
@@ -20,6 +17,6 @@ class Selective:
         prefix = 0
         if target.agent == 'executor':
             index = min(int(n.split(':')[1]) for n in runtime.invalid if n.startswith('exec:'))
-            prefix = valid_prefix(ctx.old_trace, runtime.steps, runtime.world, index)
+            prefix = runtime.prefix(index)
         runtime.rerun_suffix(prefix)
         return runtime.candidate()

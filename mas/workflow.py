@@ -15,10 +15,10 @@ def build_plan(task, reports, produce):
 
 
 def execute_steps(task, world, trace, steps, produce, start=0):
-    trace.checkpoints[str(start)] = world.snapshot()
+    trace.capture_checkpoint(start, world)
     for i in range(start, len(steps)):
         produce(f'exec:{i}', lambda i=i: agents.execute(task, i, steps[i], world))
-        trace.checkpoints[str(i + 1)] = world.snapshot()
+        trace.capture_checkpoint(i + 1, world)
 
 
 def run_workflow(task, world, fault=None, verify=False, reuse=None):
@@ -28,6 +28,9 @@ def run_workflow(task, world, fault=None, verify=False, reuse=None):
         raise ValueError('executor reuse requires recovery state/contract validation')
     trace = Trace(task.id)
     trace.context_hash = agents.config_signature(task)
+    trace.market_versions = copy.deepcopy(world.market_versions)
+    trace.news_versions = copy.deepcopy(world.news_versions)
+    trace.feed_fingerprints = world.feed_fingerprints()
     world.tool_hook = tool_hook(fault) if fault else None
 
     def produce(nid, make):
