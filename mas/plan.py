@@ -64,6 +64,25 @@ def contract(step):
     return {k: step.get(k, []) for k in ('op', 'args', 'requires', 'depends_on')}
 
 
+def action_matches(step, tool, args):
+    """Authorize tool arguments against an immutable structured plan step.
+
+    For a report, only line ending conventions and terminal newlines can differ.
+    Prose, tickers, quantities, account IDs and paths must not be changed.
+    """
+    if tool != step['op'] or not isinstance(args, dict):
+        return False
+    expected = step['args']
+    if tool != 'write_file':
+        return args == expected
+    if set(args) != {'path', 'content'} or args['path'] != expected['path']:
+        return False
+    def format_only(s):
+        return s.replace('\r\n', '\n').rstrip('\n')
+    return (isinstance(args['content'], str)
+            and format_only(args['content']) == format_only(expected['content']))
+
+
 def same_step(a, b):
     return contract(a) == contract(b)
 

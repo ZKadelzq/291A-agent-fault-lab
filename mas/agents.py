@@ -7,6 +7,7 @@ from pathlib import Path
 from . import llm
 from .env import EXEC_TOOLS, RESEARCH_TOOLS, schemas
 from .trace import Node, add_cost, zero_cost, record_usage
+from .plan import action_matches
 from .plan import normalize_steps, plan_error, instruction, digest
 
 RESEARCHER = """You are the Researcher agent in a multi-agent financial assistant (Researcher -> Planner -> Executor).
@@ -174,11 +175,30 @@ def plan(task, research_nodes):
 def execute(task, i, step, world):
     nid = f"exec:{i}"
     world.operation_id = step['logical_id']
+    if world.recovery_mode:
+        world.expected_operation = step
+        world._expected_committed = False
     try:
         text, msgs, actions, cost = run_agent(EXECUTOR.format(client=task.client_id), instruction(step),
                                               EXEC_TOOLS, world, nid)
+        if (world.recovery_mode and any(a.get('rejected_contract') for a in actions)
+                and not any(a.get('committed') and action_matches(step, a['tool'], a['args'])
+                            for a in actions)):
+            # One bounded correction turn after a rejected, side-effect-free tool call.
+            # The original plan remains authoritative. No silently rewritten writes/trades.
+            msgs = msgs + [{'role': 'user', 'content':
+                'Your previous tool call was rejected BEFORE execution. '
+                'Call the exact operation in the structured plan now, with identical JSON '
+                'arguments (including the entire write_file content). Do not paraphrase.'}]
+            corrected, msgs, extra_actions, extra_cost = run_agent(
+                None, None, EXEC_TOOLS, world, nid, max_turns=3, messages=msgs)
+            text = corrected
+            actions += extra_actions
+            cost = add_cost(cost, extra_cost)
     finally:
         world.operation_id = None
+        world.expected_operation = None
+        world._expected_committed = False
     return Node(nid, "executor", ["plan"], text, uses=list(step.get("uses", [])),
                 actions=actions, cost=cost, messages=msgs, parse="n/a", step=step)
 

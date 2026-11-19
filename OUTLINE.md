@@ -14,6 +14,8 @@ recomputation as full recovery.
 
 ---
 
+This historical planning outline is superseded by the [final course PDF](docs/CSE291A-Project5-Final.pdf) and [Option 5 evidence](docs/OPTION5_STATUS.md).
+
 ## Storyline (one paragraph)
 
 Multi-agent LLM systems pass results through messages and shared state, so one bad result
@@ -21,7 +23,9 @@ Multi-agent LLM systems pass results through messages and shared state, so one b
 unsafe actions. We build a small researcher–planner–executor workflow with programmatically checkable
 outcomes and measure how injected faults propagate (Phase 1). We then show that tracking provenance,
 including shared-state reads and writes, lets the system recover by recomputing only the affected steps.
-This is cheaper than a full restart and safer than verifying everything, but some actions cannot be undone (Phase 2).
+We evaluate its cost and correctness against full restart and preventive verification.
+Some internal work can be reused, but irreversible actions cannot be undone; prevention
+and post-hoc recovery address different points in the failure lifecycle (Phase 2).
 
 ---
 
@@ -76,6 +80,10 @@ This is cheaper than a full restart and safer than verifying everything, but som
   declared `uses` invalidate 2.5 for R-incorrect, i.e. they under-invalidate when the plan itself changes.
 
 ## 6. Results — Recovery (Phase 1 baselines + Phase 2)
+Final v5 submission: use the frozen scope in `docs/FINAL_PROTOCOL.md` and the generated
+`FINAL_REPORT.md` / `RELEASE_AUDIT.json` from `reporting/final_report.py`.
+The numerical bullets below describe the historical v4 cohort only. Do not replace
+individual rows with T6 fixes or v5 results and present them as one experiment.
 - Table 3 data: main-matrix `runs/phase2-muse-glimmer-30b/analysis.md`: per method final safe, direct/fallback/stopped, tokens, latency, mean recomputed/retained, historical external effects. The exact 396-row scope and matched settings are checked in `runs/PHASE2_AUDIT.md`.
 - Cost-versus-safety figure: `runs/phase2-muse-glimmer-30b/figs/fig4_cost.png`; use `safe_success` and show all four recovery strategies, verify, and none.
 - Reuse validity: `runs/PHASE2_PROVENANCE.md` verifies all 120/120 selective retained nodes against source identity and original action receipts; 114/120 have exact clean-control content/data. Explain why clean-text equality is not a semantic oracle. Change-aware retains 209 nodes, including 86 invalidated executor-prefix nodes revalidated against the repaired plan.
@@ -84,7 +92,9 @@ This is cheaper than a full restart and safer than verifying everything, but som
 - Detection vs. recovery: the main-matrix verifier flags 30 fault episodes, including six harmless `R-distractor` cases, and has zero false alarms on clean controls. It is a separate preventive run and cannot detect executor timeout effects. Report `safe_success` and published reconstruction separately.
 
 ## 7. Discussion & Limitations
-- Simulated tools, six tasks, one real model, one run per cell, and one-shot post-hoc injection. No confidence intervals or real trading adapter; price and account drift outside the trace are refused, not adapted to.
+- Simulated tools, six tasks, one real model, and one-shot post-hoc injection. v5 adds
+  selected three-repeat cells and pinned market-drift cases; unrecorded account drift
+  remains fail-closed. No real trading adapter or general significance claim.
 - No guarantee against arbitrary malicious agents (expected by the spec).
 
 ## 8. Experience (required by the course for the final report)
@@ -104,8 +114,8 @@ This is cheaper than a full restart and safer than verifying everything, but som
 | Oct 28 | **Phase 1 report + code due**; final Muse runs (done) | all |
 | Nov 10 | selective recovery v1: invalid set, per-node snapshots, rerun with reuse | implemented in `mas/recover/`; see Phase 2 analysis |
 | Nov 17 | reuse validity check vs. clean runs; compensating actions | completed early; see `runs/PHASE2_PROVENANCE.md` and reconcile strategy |
-| Nov 24 | changed-environment cases (irreversible effects, drift); precision vs. tracking overhead | completed early as fail-closed drift test plus saved-trace audit; live capture overhead remains unmeasured |
-| Dec 1 | final experiments frozen: selective vs. restart vs. verify, same fault schedules | 396 episodes complete and audited early; final paper still to assemble |
+| Nov 24 | changed-environment cases (irreversible effects, drift); precision vs. tracking overhead | v5.1 covers eight market changes, component timings and saved-trace graph analysis. The independent extension includes controlled off/message/RAW/checkpoint replay. |
+| Dec 1 | final experiments frozen: selective vs. restart vs. verify, same fault schedules | 524 v5.1 traces audited, including repeats and drift controls. H5–H8 add 204 audited observations; the final PDF is linked above. |
 | Dec 10 | **final report + code due** | all |
 
 ## Phase 1 report (1–2 pages) = a short cut of the sections above

@@ -4,10 +4,71 @@ Course project (Option 5). A small **Researcher → Planner → Executor** workf
 stateful finance environment. We inject controlled faults, measure how far they propagate, and
 compare full restart, always-verify, selective recovery, change-aware recovery and target-state reconciliation.
 
+## Final Phase 2 release (v5.1)
+
+**Course report and independent evaluation.** [Final PDF](docs/CSE291A-Project5-Final.pdf) · [Option 5 evidence](docs/OPTION5_STATUS.md) · [Notion](https://app.notion.com/p/Phase-2-Selective-Recovery-3fd41998e22a8028bd80c0dbc6f41e9e).
+
+Four frozen within-family holdout tasks (H5–H8) produced 204 audited episodes, including 24 clean controls. Change-aware recovery finished safely in 36/36 fault exposures and used 25.3% fewer end-to-end tokens than restart. Selective saved 18.4%. All three repeats used the same task and fault schedule. Message-only tracking omitted 15/62 reference edges; adding state RAW edges recovered all 62, with a median paired CPU increment of 169.9 µs per trace versus off. The replay covers predecoded events. [Independent evaluation](runs/phase2-holdout-muse-20261117/SUMMARY.md) · [Protocol](evaluation/PROTOCOL.md) · [Remote reproduction](docs/REMOTE_REPRODUCTION.md).
+
+**Completed November 17, 2026, on Nautilus:** 149 tests passed; all 524 archived
+traces passed the independent release audit. See the
+[final report](runs/phase2-final-muse-20261117/FINAL_REPORT.md),
+[audit](runs/phase2-final-muse-20261117/RELEASE_AUDIT.json),
+[reuse provenance](runs/phase2-final-muse-20261117/PROVENANCE.md), and
+[figures](runs/phase2-final-muse-20261117/committed/figs).
+
+Figure 5 is a post-hoc graph diagnostic, not measured recovery execution or a proof
+that declared-use edges are safe. Its changed-node count compares independently
+sampled traces and can include benign variation. Use the provenance audit for the
+missing-edge analysis and the final report for actual retained/recomputed work.
+
+Across 48 main task/fault pairs, restart, selective and change-aware each achieved
+48/48 final-state correctness and 38/48 safe completion. Selective and change-aware
+used **14.1% and 27.5% fewer total tokens** than restart, respectively, including
+the faulty source run. Ten irreversible leak cases remained unsafe. Verify prevented
+those leaks but missed executor timeouts, reaching 42/48 safe completion on its
+separate preventive runs. These results support different roles for prevention and
+recovery, not universal safety superiority.
+
+All methods completed the eight environment-change cases safely. Reconcile required
+restart fallback in all eight and cost more than restart there. All 24 recovery
+attempts with unknown commit status stopped; they are not counted as completed
+recovery. Selected T1/T6 cells have three repetitions; the full matrix has one
+observation per cell. This is a single-model, synthetic course benchmark.
+
+Start with [the frozen experiment protocol](docs/FINAL_PROTOCOL.md). It defines the
+396-row matrix, selected repeated runs, environment-change cases, budgets, related
+work, and the exact limits of each claim. Current code uses `v5.1-final-evidence`.
+Earlier result folders below are historical evidence, not measurements of v5.1.
+
+On the authorized **remote** runner:
+
+```bash
+pip install -r requirements-final.lock
+bash scripts/run_final_experiments.sh /work/phase2-final
+python analyze_phase2_provenance.py --run /work/phase2-final/committed --out /work/phase2-final/PROVENANCE.md
+python reporting/final_report.py /work/phase2-final
+```
+
+The final audit requires 524 full traces (476 standard/repeated rows, 32 environment
+recovery rows, 16 environment control traces). It independently rechecks final state,
+source pairing, retained-node provenance, publication status and fallback overhead.
+`FINAL_REPORT.md`, `RELEASE_AUDIT.json`, per-run figures and `SHA256SUMS.json` are the
+submission evidence. Poor outcomes remain in the report. Runtime metrics and traces
+are never silently substituted with historical results.
+
+Changes from v4: exact integer share checking; bounded executor-contract correction
+from the T6 fix; market-version invalidation; complete drift trace archives; correct
+publication flags; overhead accumulated across fallback; guarded source-paired resume;
+rescoring keeps embedded trace metrics consistent. Report text validation remains a
+limited heuristic. Reconcile includes deterministic execution and is not an isolated
+test of dependency precision. Verification prevents some irreversible leaks that
+post-hoc recovery cannot undo.
+
 The scenario, agent roles, tool vocabulary and attack styles (DPI / IPI / Byzantine) come from the finance scenario of
-[TAMAS](https://github.com/microsoft/TAMAS). TAMAS tools are stateless and its outcomes are scored by a GPT-4o judge.
-We need *programmatically checkable outcomes* and *shared state*, so we re-implemented the scenario as a small
-deterministic environment instead of running TAMAS directly.
+[TAMAS](https://github.com/microsoft/TAMAS). For this course's *programmatically checkable outcomes*
+and *shared-state recovery*, we implement a small deterministic environment inspired
+by that finance scenario. These results are not a reproduction of the full TAMAS benchmark.
 
 ## Phase 1 results
 
@@ -19,7 +80,7 @@ deterministic environment instead of running TAMAS directly.
 Each folder has `summary.md` (all tables), `figs/` (main run), `results.jsonl` (one row per episode) and one
 `trace.json` per episode under `<task>/<fault>/<method>/` (messages, artifacts, tool actions, dependency edges).
 The Phase 1 report is built from these two folders only. ("v2" in the folder name and the `harness` field is the
-historical harness version; current code uses `v4-recovery-evidence`.)
+historical harness version; current code uses `v5.1-final-evidence`.)
 
 ## Quick start
 
@@ -29,11 +90,11 @@ export OPENAI_API_KEY=<your TritonAI key>      # model and endpoint default to t
 # smoke test: one task, one fault, default baseline methods
 python run.py --tasks T1 --faults R-incorrect --out runs/trial-muse-glimmer-30b
 # baseline grid on the current protocol (156 episodes; use a fresh output folder)
-python run.py --extra-faults --workers 4 --out runs/baselines-v4-muse-glimmer-30b
-python summarize.py runs/baselines-v4-muse-glimmer-30b && python figures.py runs/baselines-v4-muse-glimmer-30b
+python run.py --extra-faults --workers 4 --out runs/baselines-v51-muse-glimmer-30b
+python summarize.py runs/baselines-v51-muse-glimmer-30b && python figures.py runs/baselines-v51-muse-glimmer-30b
 # controlled E-timeout (different starting cash, so a separate folder)
-python run.py --faults E-timeout --cash ample --workers 4 --out runs/etimeout-v4-muse-glimmer-30b
-python summarize.py runs/etimeout-v4-muse-glimmer-30b
+python run.py --faults E-timeout --cash ample --workers 4 --out runs/etimeout-v51-muse-glimmer-30b
+python summarize.py runs/etimeout-v51-muse-glimmer-30b
 ```
 On Windows `cmd`, use `set VAR=value` instead of `export`. Each command prints `model=...` first: check it says
 `api-muse-glimmer-30b` if using the default setup. Phase 1 took about 45 min with `--workers 4` (1 worker: about 2 h); `--resume` continues
@@ -424,3 +485,49 @@ unrecorded account drift, including `reconcile`. Irreversible history survives r
 outcomes stop all strategies. The separate retry/duplicate metrics measure behavior, not prevention.
 
 To add a task, extend `TASKS` in `mas/tasks.py`. To add a fault, extend `mas/faults.py`.
+
+## Focused environment-aware recovery extension (after T6 contract patch)
+
+The standard Phase 2 matrix still uses the **unchanged, fixed market**. Each
+`World` now owns its own market/news feed and per-ticker revisions; no experiment
+should mutate the global `mas.env.MARKET` fixture. To construct a controlled
+change *between faulty execution and recovery*, call
+`world.update_market('AAPL', rating='hold')` (or supply `price=200` / `news=...`).
+The old trace holds input revision metadata and feed fingerprints. Recovery
+invalidates the changed ticker's research node and the dependent plan, reruns
+research through regular `lookup_stock`/`get_news` tool calls, and validates
+any reused execution prefix against market price reads and state checkpoints.
+
+**Evaluation policy:** For the controlled simulator, managed trade state can
+be rolled back and re-executed at the recovery epoch. An original purchase at
+an older quote is part of the abandoned simulated branch, *not* a guaranteed
+real-world undo. Already committed external email/transfer effects survive and
+remain unsafe. The checker evaluates portfolio selection/amounts at the pinned
+recovery feed and maintains cash-flow accounting at historical execution prices
+(`trade_net_spent`), not current market value. Reconcile does not make an unsafe
+cross-price sell assumption: on feed drift it uses the bounded Restart fallback.
+The system assumes no concurrent update to the *same* World during recovery;
+per-World isolation permits different episodes to execute in parallel.
+
+Controlled local test (no API key required):
+
+```powershell
+py -m pytest -q --ignore=tests/test_nautilus_resume.py
+py scripts/run_market_drift.py --offline --task T1 --fault E-timeout --ticker AAPL --rating hold --out runs/scratch/drift-rating-v1
+py scripts/run_market_drift.py --offline --task T1 --fault E-timeout --ticker AAPL --price 200 --out runs/scratch/drift-price-v1
+```
+
+The same drift command **without** `--offline` uses the configured Muse endpoint
+and API key from `.env` or the existing process environment. Use a fresh `--out`
+for each test; the new-run artifact does not replace or merge into the 396
+pre-existing fixed-market episodes. Standard matrix comparison remains:
+
+```powershell
+py scripts/run_market_drift.py `
+  --task T1 `
+  --fault E-timeout `
+  --ticker AAPL `
+  --rating hold `
+  --out runs/phase2-muse-drift/t1
+```
+

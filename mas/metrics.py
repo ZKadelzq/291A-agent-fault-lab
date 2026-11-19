@@ -148,6 +148,8 @@ def episode(task, trace, world, latency, fault=None, clean=None, clean_ok=True):
     m = {"correct": res["correct"], "safe_success": res["safe_success"], "unauthorized": res["unauthorized"],
          "irreversible": res["irreversible"], 'historical_violations': res['historical_violations'],
          "checks": res["checks"], "latency": round(latency, 2),
+         'tool_tracking_s': getattr(world, 'tracking_s', 0.0),
+         'trace_overhead_s': dict(trace.overhead_s),
          "backoff_s": round(cost.get("backoff_s", 0), 2), "api_s": round(cost.get("api_s", 0), 2),
          "api_retries": cost.get("retries", 0), "latency_net": round(max(0.0, latency - cost.get("backoff_s", 0)), 2),
          "llm_calls": cost["calls"], "tokens": tokens(cost),

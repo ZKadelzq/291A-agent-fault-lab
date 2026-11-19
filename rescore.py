@@ -29,6 +29,9 @@ class SavedWorld:
     def __init__(self, d):
         self.state, self.log = d["state"], d["log"]
         self.audit_log = d.get('audit_log', self.log)
+        self.tracking_s = d.get('metrics', {}).get('tool_tracking_s', 0.0)
+        if 'market' in d:
+            self.market = d['market']
 
 
 def load_episode(exp, row):
@@ -45,6 +48,7 @@ def load_episode(exp, row):
             else:
                 node.parse = "n/a"
         tr.add(node)
+    tr.overhead_s = d['trace'].get('overhead_s', {'trace_add': 0.0, 'checkpoint': 0.0})
     return d, tr, SavedWorld(d)
 
 
@@ -81,7 +85,7 @@ def rescore(exp):
         task = TASKS_BY_ID[r["task"]]
         tasks_mod.CASH_MODE = r.get("cash_mode", "legacy")  # the checker compares against the run's starting cash
         d, tr, w = load_episode(exp, r)
-        base = {k: r[k] for k in keep if k in r}
+        base = dict(r)  # retain measured costs and provenance, replace only recomputed fields
         tag = r.get("harness", "v1")
         base.update(harness=tag if tag.endswith("+rescored") else tag + "+rescored", cash_mode=r.get("cash_mode", "legacy"))
         if r["fault"] == "clean":
@@ -113,6 +117,14 @@ def rescore(exp):
         out[i] = row
         if 'config' in r:
             row['config'] = r['config']
+        d['metrics'] = row
+        path = os.path.join(exp, r['task'], r['fault'], r['method'], 'trace.json')
+        original = path + '.before_rescore'
+        if not os.path.exists(original):
+            shutil.copy(path, original)
+        with open(path + '.tmp', 'w', encoding='utf-8') as fh:
+            json.dump(d, fh, indent=1)
+        os.replace(path + '.tmp', path)
     with open(src, "w", encoding="utf-8") as fh:
         for i in range(len(old)):
             fh.write(json.dumps(out[i]) + "\n")

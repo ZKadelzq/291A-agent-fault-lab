@@ -6,6 +6,7 @@
 """
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -29,7 +30,7 @@ from mas.trace import Node, Trace
 from mas.workflow import run_workflow
 
 
-HARNESS = "v4-recovery-evidence"
+HARNESS = "v5.1-final-evidence"
 
 
 def expected_episode_keys(tasks, faults, methods, extra=False):
@@ -48,8 +49,16 @@ def expected_episode_keys(tasks, faults, methods, extra=False):
 
 
 def experiment_config():
+    root = Path(__file__).parent
+    files = sorted([*root.glob('*.py'), *(root / 'scripts').glob('*.py')])
+    harness_digest = hashlib.sha256(''.join(str(p.relative_to(root)) + p.read_text()
+                                           for p in files).encode()).hexdigest()
     return {'signature': config_signature(), 'cash_mode': tasks_mod.CASH_MODE,
+            'harness_digest': harness_digest,
             'harness': HARNESS, 'recovery_fallbacks': 1,
+            'budget': {'agent_turns': 8, 'json_reasks': 1, 'verifier_regenerations': 1,
+                       'recovery_executor_correction_turns': 3,
+                       'max_completion_tokens': llm.MAX_TOKENS or 'server_default'},
             'timeout_outcome': faults_mod.TIMEOUT_OUTCOME,
             'fault_timeout_s': faults_mod.TIMEOUT_S, 'api_timeout_s': llm.TIMEOUT, 'api_retries': llm.RETRIES}
 
@@ -57,9 +66,19 @@ def experiment_config():
 def save(out, task, fault_name, method, trace, world, metrics):
     d = os.path.join(out, task.id, fault_name, method)
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "trace.json"), "w") as f:
-        json.dump({"metrics": metrics, "trace": trace.to_dict(), "state": world.state, "log": world.log,
-                   'audit_log': world.audit_log}, f, indent=1)
+    start = time.perf_counter()
+    text = json.dumps({"metrics": metrics, "trace": trace.to_dict(), "state": world.state, "log": world.log,
+                      'market': world.market, 'news': world.news,
+                      'audit_log': world.audit_log}, indent=1)
+    serialized = time.perf_counter()
+    tmp = Path(d) / 'trace.json.tmp'
+    tmp.write_text(text)
+    tmp.replace(Path(d) / 'trace.json')
+    finished = time.perf_counter()
+    # Kept outside metrics to avoid self-referential serialization timings.
+    (Path(d) / 'artifact_io.json').write_text(json.dumps({
+        'serialization_s': serialized - start, 'write_s': finished - serialized,
+        'bytes': len(text.encode()), 'scope': 'trace archive only; excludes this sidecar; outside episode latency'}))
 
 
 def timed(fn, *a, **kw):
@@ -136,7 +155,8 @@ def run_fault(task, fault, clean, clean_ok, methods, out, resume=False):
     if resume:  # whole (task, fault) job is skipped only if every requested method finished
         need = ["none"] + [m for m in [*METHODS, 'verify'] if m in methods]
         saved = [load_row(out, task, fault.name, m) for m in need]
-        if all(saved):
+        if all(saved) and all(x[1].get('source_trace_id') == saved[0][0].run_id
+                              for m, x in zip(need, saved) if m in METHODS):
             print(f"[{task.id}] {fault.name:12s} (resumed)", flush=True)
             return [x[1] for x in saved]
     rows = []

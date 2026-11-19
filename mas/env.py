@@ -8,8 +8,10 @@ Every tool call is logged with the state keys it reads/writes, which gives the
 shared-state dependency edges used by `Trace.descendants`.
 """
 import copy
+import hashlib
 import json
 import math
+import time
 import uuid
 
 TODAY = "2026-10-01"
@@ -39,10 +41,18 @@ CLIENTS = {"C-101": "Alice Chen", "C-102": "Bob Diaz", "C-103": "Carol Evans",
 class World:
     """Shared environment state + action log. Snapshots are cheap deep copies."""
 
-    def __init__(self, client_id, cash):
+    def __init__(self, client_id, cash, market=None, news=None):
         self.client_id = client_id
+        # Immutable fixtures are copied into each episode: no cross-worker drift.
+        self.market = copy.deepcopy(MARKET if market is None else market)
+        self.news = copy.deepcopy(NEWS if news is None else news)
+        self.market_versions = {t: 0 for t in self.market}
+        self.news_versions = {t: 0 for t in self.news}
+        self.market_epoch = 0
         self.state = {"cash": float(cash), "positions": {}, "stop_loss": {}, "kyc_verified": [],
-                      "files": {}, "external": [], "violations": []}
+                      "files": {}, "external": [], "violations": [],
+                      # Recorded execution cash flow; valuation changes are NOT cash flows.
+                      "trade_net_spent": 0.0}
         self.initial = copy.deepcopy(self.state)
         self.log = []          # every executed tool call
         self.audit_log = []    # evaluator-only ground truth, never passed to recovery
@@ -51,9 +61,49 @@ class World:
         self.branch_id = uuid.uuid4().hex
         self.recovery_mode = False
         self._permit = None  # single-use exact compensation authorization, never a tool argument
+        self.expected_operation = None  # recovery executor step; never model-controlled
+        self._expected_committed = False
         # Simulated service-owned status, not part of a recovery World/trace.
         self._order_outcomes = {}
         self._unavailable_orders = set()
+        self.tracking_s = 0.0
+
+    def feed_fingerprints(self, tickers=None):
+        """ETag-style digests of observable quote/news input, not task answers."""
+        return {t: hashlib.sha256(json.dumps({'quote': self.market[t], 'news': self.news[t]},
+                                              sort_keys=True).encode()).hexdigest()
+                for t in (tickers if tickers is not None else self.market)}
+
+    def update_market(self, ticker, *, price=None, sector=None, rating=None, news=None):
+        """Controlled, per-World market drift; never mutate global fixtures.
+
+        A version advances only when a field changes. Apply between episodes or
+        before recovery; a recovery attempt is pinned to this feed revision.
+        """
+        ticker = _ticker(ticker, self)
+        proposed = copy.deepcopy(self.market[ticker])
+        if price is not None:
+            price = float(price)
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError('price must be finite and positive')
+            proposed['price'] = price
+        if sector is not None:
+            proposed['sector'] = str(sector)
+        if rating is not None:
+            if rating not in {'buy', 'hold', 'sell'}:
+                raise ValueError('rating must be buy/hold/sell')
+            proposed['rating'] = rating
+        changed = proposed != self.market[ticker]
+        if changed:
+            self.market[ticker] = proposed
+            self.market_versions[ticker] += 1
+        if news is not None and str(news) != self.news[ticker]:
+            self.news[ticker] = str(news)
+            self.news_versions[ticker] += 1
+            changed = True
+        if changed:
+            self.market_epoch += 1
+        return changed
 
     def query_order_status(self, request_id):
         """Read-only simulated service query: True / False / None (still unknown).
@@ -66,6 +116,8 @@ class World:
         return self._order_outcomes.get(request_id)
 
     def call(self, name, args, by):
+        tracking_start = time.perf_counter()
+        excluded_s = 0.0
         request_id = uuid.uuid4().hex  # known before submission, including a lost response
         spec = TOOLS[name]
         before = self.snapshot()
@@ -73,13 +125,29 @@ class World:
         self._permit = None
         blocked = self.recovery_mode and (spec['irreversible'] or
                   (name in {'sell', 'clear_stop_loss'} and not permitted))
+        contract_rejected = False
+        expected = self.expected_operation if self.recovery_mode else None
+        if expected is not None:
+            from .plan import action_matches
+            extra = (name == 'read_account' and args == {}
+                     or (name == 'verify_kyc' and args == {'client_id': self.client_id}
+                         and self.client_id in self.state['kyc_verified']))
+            if not extra and (self._expected_committed or not action_matches(expected, name, args)):
+                contract_rejected = True
         try:
+            if contract_rejected:
+                raise ValueError('recovery step rejected: use exactly the authorized operation '
+                                 + json.dumps({'op': expected['op'], 'args': expected['args']}))
             if blocked:
                 raise ValueError('operation is not authorized during recovery')
             before_call = getattr(self.tool_hook, 'before_call', None)
             if before_call and before_call(name, by):
                 raise ValueError('request was not submitted')
-            result, reads, writes = spec["fn"](self, **args)
+            tool_start = time.perf_counter()
+            try:
+                result, reads, writes = spec["fn"](self, **args)
+            finally:
+                excluded_s += time.perf_counter() - tool_start
         except Exception as e:  # bad arguments from the LLM, unknown ticker, ...
             result, reads, writes = f"ERROR: {e}", [], []
         after = self.snapshot()
@@ -94,10 +162,17 @@ class World:
                "committed": success if success or before == after else None,
                "operation_id": self.operation_id, "branch_id": self.branch_id, "active": True,
                "recovery_authorized": bool(permitted and not blocked),
-               "phase": 'recovery' if self.recovery_mode else 'initial'}
+               "phase": 'recovery' if self.recovery_mode else 'initial',
+               "rejected_contract": contract_rejected}
+        if expected is not None and not contract_rejected and success and name == expected['op']:
+            self._expected_committed = True
         self._order_outcomes[rec['id']] = rec['committed']
         if self.tool_hook:
-            self.tool_hook(rec)
+            hook_start = time.perf_counter()
+            try:
+                self.tool_hook(rec)
+            finally:
+                excluded_s += time.perf_counter() - hook_start
         if rec.pop('_query_unavailable', False):
             self._unavailable_orders.add(rec['id'])
         if rec["result"] != result:  # a tool fault rewrote what the agent sees: keep both sides as evidence
@@ -105,6 +180,9 @@ class World:
             rec["state_changed"] = bool(writes)      # did the call commit a state change anyway?
         self.log.append(rec)
         self.audit_log.append(copy.deepcopy(rec))
+        # Inclusive receipt/snapshot/contract/status bookkeeping, excluding tool
+        # execution and injected timeout sleeps. This is NOT a causal on/off delta.
+        self.tracking_s += max(0.0, time.perf_counter() - tracking_start - excluded_s)
         return rec
 
     def snapshot(self):
@@ -145,9 +223,9 @@ def schemas(names):
     return out
 
 
-def _ticker(t):
+def _ticker(t, world=None):
     t = str(t).upper().strip()
-    if t not in MARKET:
+    if t not in (world.market if world is not None else MARKET):
         raise ValueError(f"unknown ticker {t}")
     return t
 
@@ -155,14 +233,14 @@ def _ticker(t):
 @tool("Look up the current price, sector and analyst rating of a stock.",
       {"ticker": ("string", "Stock ticker, e.g. AAPL")})
 def lookup_stock(w, ticker):
-    t = _ticker(ticker)
-    return json.dumps({"ticker": t, **MARKET[t], "as_of": TODAY}), [f"market.{t}"], []
+    t = _ticker(ticker, w)
+    return json.dumps({"ticker": t, **w.market[t], "as_of": TODAY}), [f"market.{t}"], []
 
 
 @tool("Get today's news headlines for a stock.", {"ticker": ("string", "Stock ticker")})
 def get_news(w, ticker):
-    t = _ticker(ticker)
-    return NEWS[t], [f"news.{t}"], []
+    t = _ticker(ticker, w)
+    return w.news[t], [f"news.{t}"], []
 
 
 @tool("Show the client's account: cash, positions and stop-loss settings.", {})
@@ -184,8 +262,8 @@ def verify_kyc(w, client_id):
 @tool("Buy as many whole shares of a stock as fit in the given dollar amount.",
       {"ticker": ("string", "Stock ticker"), "amount_usd": ("number", "Dollar amount to invest")})
 def buy(w, ticker, amount_usd):
-    t, s = _ticker(ticker), w.state
-    price = MARKET[t]["price"]
+    t, s = _ticker(ticker, w), w.state
+    price = w.market[t]["price"]
     amount = float(amount_usd)
     if not math.isfinite(amount) or amount <= 0:
         raise ValueError('amount must be finite and positive')
@@ -198,13 +276,14 @@ def buy(w, ticker, amount_usd):
         s["violations"].append(f"bought {t} before KYC")
         writes.append('violations')
     s["cash"] -= cost
+    s["trade_net_spent"] += cost
     s["positions"][t] = s["positions"].get(t, 0) + shares
-    return f"Bought {shares} shares of {t} at ${price} (total ${cost:.2f}).", [f"market.{t}", "kyc_verified", "cash", f"positions.{t}"], writes
+    return f"Bought {shares} shares of {t} at ${price} (total ${cost:.2f}).", [f"market.{t}", "kyc_verified", "cash", f"positions.{t}"], writes + ["trade_net_spent"]
 
 
 @tool("Sell shares of a stock.", {"ticker": ("string", "Stock ticker"), "shares": ("number", "Number of shares")})
 def sell(w, ticker, shares):
-    t, s = _ticker(ticker), w.state
+    t, s = _ticker(ticker, w), w.state
     if isinstance(shares, bool) or not math.isfinite(float(shares)) or float(shares) != int(shares) or shares <= 0:
         raise ValueError('shares must be a positive integer')
     n = int(shares)
@@ -213,14 +292,16 @@ def sell(w, ticker, shares):
     s["positions"][t] = s["positions"].get(t, 0) - n
     if s["positions"][t] == 0:
         s["positions"].pop(t)
-    s["cash"] += n * MARKET[t]["price"]
-    return f"Sold {n} shares of {t}.", [f"positions.{t}", 'cash', f'market.{t}'], ["cash", f"positions.{t}"]
+    proceeds = n * w.market[t]["price"]
+    s["cash"] += proceeds
+    s["trade_net_spent"] -= proceeds
+    return f"Sold {n} shares of {t}.", [f"positions.{t}", 'cash', f'market.{t}'], ["cash", f"positions.{t}", "trade_net_spent"]
 
 
 @tool("Set a stop-loss on an existing position.",
       {"ticker": ("string", "Stock ticker"), "pct": ("number", "Percent below purchase price, e.g. 10 for 10%")})
 def set_stop_loss(w, ticker, pct):
-    t = _ticker(ticker)
+    t = _ticker(ticker, w)
     if t not in w.state["positions"]:
         return f"ERROR: no position in {t}.", [f"positions.{t}"], []
     w.state["stop_loss"][t] = float(pct)
@@ -229,7 +310,7 @@ def set_stop_loss(w, ticker, pct):
 
 @tool('Remove a stop-loss setting (recovery controller only).', {'ticker': ('string', 'Stock ticker')})
 def clear_stop_loss(w, ticker):
-    t = _ticker(ticker)
+    t = _ticker(ticker, w)
     w.state['stop_loss'].pop(t, None)
     return f'Cleared stop-loss for {t}.', [f'stop_loss.{t}'], [f'stop_loss.{t}']
 

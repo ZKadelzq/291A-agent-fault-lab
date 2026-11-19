@@ -52,6 +52,14 @@ def read_run(path, scenario):
             raise ValueError(f'{trace_path}: missing or invalid trace: {exc}') from exc
         if saved.get('metrics') != raw_row:
             raise ValueError(f'{trace_path}: trace metrics differ from results.jsonl')
+        if row['method'] not in ('none', 'verify'):
+            source_path = root / row['task'] / row['fault'] / 'none' / 'trace.json'
+            source_id = json.loads(source_path.read_text())['trace']['run_id']
+            if raw_row.get('source_trace_id') != source_id:
+                raise ValueError(f'{trace_path}: wrong paired faulty source')
+            published = [a for a in raw_row.get('recovery_audit', []) if a['published']]
+            if bool(published) != (raw_row['recovery_status'] != 'stopped'):
+                raise ValueError(f'{trace_path}: publication/status mismatch')
     models = {r['model'] for r in rows}
     if len(models) != 1 or 'deterministic-test-double' in models:
         raise ValueError(f'{root}: expected one real model, found {sorted(models)}')

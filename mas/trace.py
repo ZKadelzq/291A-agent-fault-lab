@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import copy
 import uuid
+import time
 
 _cost_sink = ContextVar('recovery_cost_sink', default=None)
 
@@ -79,13 +80,23 @@ class Trace:
         # Terminal observation is independent of executor-prefix checkpoints.
         self.final_state = None
         self.new_cost = None  # actual new work, excluding historical costs on reused nodes
+        self.market_versions = None  # recorded source feed revisions for targeted invalidation
+        self.news_versions = None
+        self.feed_fingerprints = None
+        self.overhead_s = {'trace_add': 0.0, 'checkpoint': 0.0}
 
     def add(self, node):
+        start = time.perf_counter()
         self.nodes[node.id] = node
+        self.overhead_s['trace_add'] += time.perf_counter() - start
+
+    def capture_checkpoint(self, key, world):
+        start = time.perf_counter()
+        self.checkpoints[str(key)] = world.snapshot()
+        self.overhead_s['checkpoint'] += time.perf_counter() - start
 
     def edges(self, state=True, conflicts=False):
-        """(src, dst) pairs. Message edges come from `parents`; state edges link a node that
-        reads a state key to every earlier node that wrote it (read-after-write)."""
+        """(src, dst) pairs. Message and state RAW edges (plus optional WAW/WAR)."""
         out = {(p, n.id) for n in self.nodes.values() for p in n.parents if p in self.nodes}
         if state:
             order = list(self.nodes.values())
@@ -122,16 +133,22 @@ class Trace:
 
     def to_dict(self):
         return {"task_id": self.task_id, "nodes": [asdict(n) for n in self.nodes.values()],
-                "edges": sorted(self.edges()), 'schema_version': 4, 'run_id': self.run_id,
+                "edges": [list(edge) for edge in sorted(self.edges())], 'schema_version': 4, 'run_id': self.run_id,
                 'source_trace_id': self.source_trace_id, 'context_hash': self.context_hash,
-                'checkpoints': self.checkpoints, 'final_state': self.final_state, 'new_cost': self.new_cost}
+                'checkpoints': self.checkpoints, 'final_state': self.final_state, 'new_cost': self.new_cost,
+                'market_versions': self.market_versions, 'news_versions': self.news_versions,
+                'feed_fingerprints': self.feed_fingerprints,
+                'overhead_s': self.overhead_s}
 
     @classmethod
     def from_dict(cls, data):
         trace = cls(data['task_id'])
-        for key in ('run_id', 'source_trace_id', 'context_hash', 'checkpoints', 'final_state', 'new_cost'):
+        for key in ('run_id', 'source_trace_id', 'context_hash', 'checkpoints', 'final_state', 'new_cost',
+                    'market_versions', 'news_versions', 'feed_fingerprints', 'overhead_s'):
             if key in data:
                 setattr(trace, key, copy.deepcopy(data[key]))
         for n in data['nodes']:
             trace.add(Node(**{k: v for k, v in n.items() if k in Node.__dataclass_fields__}))
+        # Loading old nodes is not new provenance-capture work.
+        trace.overhead_s = copy.deepcopy(data.get('overhead_s', {'trace_add': 0.0, 'checkpoint': 0.0}))
         return trace
